@@ -247,7 +247,7 @@ def validate_input(
     result = validator.validate_input_array(input_data, expected_shape, expected_dtype)
 
     if not result.is_valid:
-        raise ValidationError(result.message, invalid_value=input_data)
+        raise ValidationError(result.message or "Validation failed", invalid_value=input_data)
 
     validated_data = result.corrected_value if result.corrected_value is not None else input_data
     warnings = result.warnings or []
@@ -274,7 +274,7 @@ def validate_model_spec(model_spec: Any, strict: bool = False) -> None:
 
     if not result.is_valid:
         raise ValidationError(
-            result.message,
+            result.message or "Validation failed",
             invalid_value=model_spec,
             expected=f"Valid {model_spec.__class__.__name__}",
         )

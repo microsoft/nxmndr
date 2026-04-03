@@ -152,10 +152,11 @@ class Config:
             ("server", self.server),
             ("rpc", self.rpc),
         ]:
-            result[section_name] = {
-                field.name: getattr(section, field.name)
-                for field in section.__dataclass_fields__.values()
-            }
+            if hasattr(section, "__dataclass_fields__"):
+                result[section_name] = {
+                    f.name: getattr(section, f.name)
+                    for f in section.__dataclass_fields__.values()
+                }
         return result
 
 

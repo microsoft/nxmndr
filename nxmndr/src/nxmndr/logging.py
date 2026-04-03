@@ -114,6 +114,7 @@ def setup_logging(
         numeric_level = logging.INFO
 
     # Choose formatter
+    formatter: logging.Formatter
     if format_type == "json":
         formatter = StructuredFormatter(include_extra=include_extra)
     else:

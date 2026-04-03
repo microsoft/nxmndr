@@ -47,6 +47,9 @@ class RegistryEntry:
 
     @staticmethod
     def from_dict(payload: Dict[str, object]) -> "RegistryEntry":
+        metadata_dict = payload.get("metadata")
+        if not isinstance(metadata_dict, dict):
+            metadata_dict = {}
         return RegistryEntry(
             entry_id=str(payload.get("entry_id") or uuid.uuid4().hex),
             model_id=str(payload.get("model_id") or ""),
@@ -56,7 +59,7 @@ class RegistryEntry:
             format=str(payload.get("format") or ""),
             last_used_epoch_ms=int(payload.get("last_used_epoch_ms") or 0),
             metadata={
-                str(k): str(v) for k, v in (payload.get("metadata") or {}).items()
+                str(k): str(v) for k, v in metadata_dict.items()
             },
         )
 

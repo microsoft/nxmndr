@@ -11,7 +11,7 @@ from PIL import Image
 
 
 def load_images_to_batch(
-    items: Sequence[Union[str, Path, np.ndarray]], target_size: Tuple[int, int] = None
+    items: Sequence[Union[str, Path, np.ndarray]], target_size: Union[Tuple[int, int], None] = None
 ) -> np.ndarray:
     """Load image paths or numpy arrays into a single NCHW float32 batch.
 
@@ -209,7 +209,8 @@ def pack_tensor_bundle(tensors: Mapping[str, np.ndarray]) -> bytes:
         raise ValueError("Tensor bundle cannot be empty")
 
     buffer = io.BytesIO()
-    np.savez_compressed(buffer, **{key: np.ascontiguousarray(val) for key, val in tensors.items()})
+    tensor_dict = {key: np.ascontiguousarray(val) for key, val in tensors.items()}
+    np.savez_compressed(buffer, **tensor_dict)
     buffer.seek(0)
     return buffer.read()
 
@@ -227,7 +228,7 @@ def unpack_tensor_bundle(payload: bytes) -> Dict[str, np.ndarray]:
 
 def parse_geotransform(
     value: Union[str, Sequence[float], None],
-) -> Tuple[float, float, float, float, float, float] | None:
+) -> Union[Tuple[float, float, float, float, float, float], None]:
     """Parse a geotransform string/list into a 6-tuple."""
 
     if value is None:
@@ -236,20 +237,20 @@ def parse_geotransform(
     if isinstance(value, (list, tuple)):
         if len(value) != 6:
             return None
-        return tuple(float(v) for v in value)
+        return tuple(float(v) for v in value)  # type: ignore
 
     try:
-        data = json.loads(value)
+        data = json.loads(value)  # type: ignore
     except (TypeError, json.JSONDecodeError):
         return None
 
     if isinstance(data, (list, tuple)) and len(data) == 6:
-        return tuple(float(v) for v in data)
+        return tuple(float(v) for v in data)  # type: ignore
 
     if isinstance(data, MutableMapping):
         ordered = [data.get(str(idx)) for idx in range(6)]
         if all(item is not None for item in ordered):
-            return tuple(float(v) for v in ordered)
+            return tuple(float(v) for v in ordered)  # type: ignore
     return None
 
 

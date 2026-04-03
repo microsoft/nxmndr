@@ -6,7 +6,7 @@ import json
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, fields
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -56,12 +56,13 @@ class ModelSpec(ABC):
     @classmethod
     def from_json(cls, json_str: str):
         """Create ModelSpec from JSON string."""
+        from dataclasses import is_dataclass
         data = json.loads(json_str)
         # Remove 'type' field used for registry dispatch
         data.pop("type", None)
         # Filter only fields that exist in this dataclass
-        if hasattr(cls, "__dataclass_fields__"):
-            field_names = {f.name for f in fields(cls)}
+        if is_dataclass(cls):
+            field_names = {f.name for f in fields(cls)}  # type: ignore
             filtered_data = {k: v for k, v in data.items() if k in field_names}
         else:
             filtered_data = data
@@ -69,8 +70,9 @@ class ModelSpec(ABC):
 
     def to_json(self) -> str:
         """Serialize ModelSpec to JSON string."""
-        if hasattr(self, "__dataclass_fields__"):
-            data = asdict(self)
+        from dataclasses import is_dataclass
+        if is_dataclass(self):
+            data = asdict(self)  # type: ignore
         else:
             # Fallback for non-dataclass specs
             data = {k: v for k, v in self.__dict__.items() if not k.startswith("_")}
@@ -196,7 +198,7 @@ class PytorchModel(Model):
 
         return tensor
 
-    def postprocess(self, model_output, task: Optional[Task] = None):
+    def postprocess(self, model_output: Any, task: Optional[object] = None) -> Any:
         """Postprocess model output."""
         if torch.is_tensor(model_output):
             # Move to CPU for consistency and memory efficiency
@@ -319,7 +321,7 @@ class HuggingFaceModel(PytorchModel):
         self.processor = processor
         self.repo_path = repo_path
 
-    def preprocess(self, input_data, task: Optional[Task] = None):
+    def preprocess(self, input_data: Any, task: Optional[object] = None) -> Any:
         # Ensure input data is writable to avoid PyTorch warnings
         if isinstance(input_data, np.ndarray) and not input_data.flags.writeable:
             input_data = np.copy(input_data)
@@ -441,7 +443,7 @@ class HuggingFaceModel(PytorchModel):
 
             return result
 
-    def postprocess(self, model_output, task: Optional[Task] = None, preprocessed_context=None):
+    def postprocess(self, model_output: Any, task: Optional[object] = None, preprocessed_context: Any = None) -> Any:
         """Postprocess HuggingFace model output.
 
         HuggingFace models often return dictionaries with keys like 'logits', 'loss', etc.
@@ -496,7 +498,7 @@ class HuggingFaceModel(PytorchModel):
                                     # Resize using PIL
                                     mask_uint8 = (mask_2d * 255).astype(np.uint8)
                                     mask_pil = Image.fromarray(mask_uint8, mode="L")
-                                    mask_resized = mask_pil.resize((orig_w, orig_h), Image.NEAREST)
+                                    mask_resized = mask_pil.resize((orig_w, orig_h), Image.Resampling.NEAREST)
                                     mask_resized_np = (np.array(mask_resized) > 127).astype(
                                         np.uint8
                                     )
@@ -557,10 +559,10 @@ class RemoteModel(Model):
     def __init__(self, inference_provider):
         self.inference_provider = inference_provider
 
-    def preprocess(self, input_data, task: Optional[Task] = None):
+    def preprocess(self, input_data: Any, task: Optional[object] = None) -> Any:
         return input_data
 
-    def postprocess(self, model_output, task: Optional[Task] = None):
+    def postprocess(self, model_output: Any, task: Optional[object] = None) -> Any:
         return model_output
 
     def predict(self, input_data):
