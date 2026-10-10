@@ -3,6 +3,6 @@
 
 -r requirements.txt
 
-aiohttp==3.13.3
+aiohttp==3.13.4
 azure-identity==1.25.3
 openai==2.29.0
