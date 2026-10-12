@@ -60,7 +60,7 @@ geo = [
 # Extra for development (linting, testing, proto generation)
 dev = [
   "grpcio-tools==1.78.0",
-  "pytest==9.0.2",
+  "pytest==9.0.3",
   "pytest-cov==7.1.0",
   "ruff==0.15.7",
   "black==26.3.1",
