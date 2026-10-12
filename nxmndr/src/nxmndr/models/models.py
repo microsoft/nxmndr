@@ -98,19 +98,24 @@ class PytorchModelSpec(ModelSpec):
     model_class: nn.Module
     model_path: str
     name: Optional[str] = None
+    # Constructor arguments of a catalog model_class (nxmndr.models.catalog), from
+    # ModelSpec.metadata: num_classes, in_channels.
+    catalog_args: Optional[dict] = None
 
     @classmethod
     def from_json(cls, json_str):
         """Custom from_json to handle model_class resolution."""
         d = json.loads(json_str)
         model_class_field = d["model_class"]
-        # Accept either a registered class name or a fully qualified string
+        # A registered class name resolves to its class; any other string stays as given
+        # (a catalog name, built by nxmndr.models.catalog).
         registry = get_registry()
         resolved = registry.get_model_class(model_class_field)
         return cls(
             model_class=resolved if resolved is not None else model_class_field,
             model_path=d["model_path"],
             name=d.get("name"),
+            catalog_args=d.get("catalog_args"),
         )
 
 
@@ -450,6 +455,82 @@ class HuggingFaceModel(PytorchModel):
         """
         # Handle SAM3 pred_masks directly
         if isinstance(model_output, dict):
+            # SAM3: prefer the processor's own instance post-processing, which scores every query
+            # (pred_logits x presence_logits), keeps only those above the score threshold, resizes the
+            # kept masks to the input size and binarises them. The hand-rolled branch below thresholds
+            # all 200 queries and produced up to 100 low-confidence masks per chip.
+            if (
+                "pred_masks" in model_output
+                and "pred_logits" in model_output
+                and preprocessed_context is not None
+                and hasattr(self.processor, "post_process_instance_segmentation")
+            ):
+                try:
+                    import os as _os
+
+                    score_thr = float(_os.environ.get("NXMNDR_SAM3_SCORE_THRESHOLD", "0.3"))  # transformers default
+                    mask_thr = float(_os.environ.get("NXMNDR_SAM3_MASK_THRESHOLD", "0.5"))  # transformers default
+                    original_sizes = preprocessed_context.get("original_sizes")
+                    target_sizes = None
+                    if original_sizes is not None:
+                        sizes = original_sizes.tolist() if torch.is_tensor(original_sizes) else original_sizes
+                        target_sizes = [tuple(int(v) for v in sz) for sz in sizes]
+                    if score_thr <= 0:
+                        # Score-free selection (unprompted use): the concept score is uninformative when no
+                        # concept is given (presence ~0.01), so keep every query mask and select by geometry:
+                        # area window, IoU dedupe in raw-logit order, then the group-mask filter.
+                        from .sam import drop_group_masks, select_masks_by_area_and_iou
+
+                        min_area = float(_os.environ.get("NXMNDR_SAM3_MIN_AREA", "0.001"))
+                        max_area = float(_os.environ.get("NXMNDR_SAM3_MAX_AREA", "0.5"))
+                        iou_thr = float(_os.environ.get("NXMNDR_SAM3_NMS_IOU", "0.5"))
+                        pm = model_output["pred_masks"]
+                        if target_sizes:
+                            pm = torch.nn.functional.interpolate(
+                                pm.float(), size=target_sizes[0], mode="bilinear", align_corners=False
+                            )
+                        binm = (pm.sigmoid()[0] > mask_thr).to(torch.uint8).cpu().numpy()
+                        raw = model_output["pred_logits"].sigmoid()[0].detach().cpu().numpy()
+                        order = np.argsort(-raw)
+                        kept = select_masks_by_area_and_iou(binm, order, min_area, max_area, iou_thr)
+                        masks = binm[kept] if kept else np.zeros((0,) + binm.shape[1:], np.uint8)
+                        if masks.shape[0] > 1:
+                            masks = masks[drop_group_masks(masks, logger=logger)]
+                        logger.info(
+                            "SAM3: score-free selection kept %d of %d masks (area %.3f-%.2f, IoU %.2f)",
+                            masks.shape[0], binm.shape[0], min_area, max_area, iou_thr,
+                        )
+                        return masks
+                    res = self.processor.post_process_instance_segmentation(
+                        model_output, threshold=score_thr, mask_threshold=mask_thr, target_sizes=target_sizes
+                    )[0]
+                    scores, masks = res["scores"], res["masks"]
+                    if len(masks) == 0:
+                        logger.info("SAM3: no instance above score threshold %.2f", score_thr)
+                        h, w = target_sizes[0] if target_sizes else tuple(model_output["pred_masks"].shape[-2:])
+                        return np.zeros((0, int(h), int(w)), dtype=np.uint8)
+                    order = torch.argsort(scores, descending=True)  # highest score first
+                    masks = masks[order].to(torch.uint8).cpu().numpy()
+                    scores = scores[order].detach().cpu().numpy()
+                    if masks.shape[0] > 1:
+                        from .sam import drop_group_masks
+
+                        kept = drop_group_masks(masks, logger=logger)
+                        masks, scores = masks[kept], scores[kept]
+                        if masks.shape[0] == 0:
+                            logger.info("SAM3: every instance was dropped as a group mask")
+                            return masks  # (0, H, W) uint8
+                    max_masks = 100
+                    if masks.shape[0] > max_masks:
+                        logger.warning("SAM3: limiting from %d to %d masks", masks.shape[0], max_masks)
+                        masks, scores = masks[:max_masks], scores[:max_masks]
+                    logger.info(
+                        "SAM3: %d instances with score > %.2f (scores %.2f..%.2f) shape %s",
+                        masks.shape[0], score_thr, float(scores.min()), float(scores.max()), masks.shape,
+                    )
+                    return masks
+                except Exception as exc:  # pragma: no cover - fall back to the legacy thresholding
+                    logger.warning("SAM3: processor post-processing failed (%s); using legacy thresholding", exc)
             # Handle SAM3 mask outputs
             if "pred_masks" in model_output:
                 from PIL import Image

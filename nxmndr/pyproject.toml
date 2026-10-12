@@ -29,6 +29,9 @@ classifiers = [
 dependencies = [
   "numpy==2.4.3",
   "torch==2.11.0",
+  # torchvision models are the required family of the PyTorch model catalog
+  # (nxmndr.models.catalog).
+  "torchvision==0.26.0",
   "onnxruntime==1.24.4",
   "transformers==5.3.0",
   "grpcio==1.78.0",
@@ -50,6 +53,10 @@ server = [
   "azure-identity==1.25.3",
   "openai==2.29.0",
 ]
+# Extra for the torchgeo family of the PyTorch model catalog (nxmndr.models.catalog)
+geo = [
+  "torchgeo==0.10.1",
+]
 # Extra for development (linting, testing, proto generation)
 dev = [
   "grpcio-tools==1.78.0",
@@ -64,7 +71,11 @@ dev = [
   "jupyter==1.1.1",
   "ipykernel==7.2.0",
   "pip-audit==2.10.0",
-  "onnxscript==0.2.5",
+  # torch 2.11's default (dynamo) ONNX exporter, used by tst/conftest.py to export
+  # tst/example_model: needs onnxscript with opset 23 and onnx_ir.
+  "onnxscript==0.7.2",
+  "onnx-ir==1.0.0",
+  "onnx==1.23.0",
 ]
 
 [project.scripts]

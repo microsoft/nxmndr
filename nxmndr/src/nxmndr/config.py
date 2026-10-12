@@ -73,7 +73,7 @@ class ServerConfig:
     """Configuration for the gRPC server."""
 
     # Server settings
-    host: str = field(default_factory=lambda: os.getenv("INFERENCE_SERVER_HOST", "[::]"))
+    host: str = field(default_factory=lambda: os.getenv("INFERENCE_SERVER_HOST", "127.0.0.1"))
     port: int = field(default_factory=lambda: int(os.getenv("INFERENCE_SERVER_PORT", "50051")))
     max_workers: int = field(
         default_factory=lambda: int(os.getenv("INFERENCE_SERVER_MAX_WORKERS", "4"))
@@ -205,7 +205,7 @@ Caching:
   INFERENCE_PREPROCESS_CACHE_SIZE: Preprocessing cache size [default: 1000]
 
 Server:
-  INFERENCE_SERVER_HOST: Server bind host [default: [::]]
+  INFERENCE_SERVER_HOST: Server bind host [default: 127.0.0.1]
   INFERENCE_SERVER_PORT: Server port [default: 50051]
   INFERENCE_SERVER_MAX_WORKERS: Max worker threads [default: 4]
   INFERENCE_SERVER_MAX_MESSAGE_SIZE: Max message size in bytes [default: 4194304]

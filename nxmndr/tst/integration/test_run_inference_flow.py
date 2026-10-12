@@ -8,7 +8,7 @@ from pathlib import Path
 
 from nxmndr.client import InferenceGrpcClient
 from nxmndr.inference import inference_pb2
-from tst.integration.remote_test_utils import test_server as start_test_server
+from tst.integration.remote_test_utils import start_test_server
 from tst.example_model.modeling_exampleconv import export
 
 
@@ -32,7 +32,7 @@ def test_run_inference_flow_with_raster(tmp_path, synthetic_tif):
     bound_port = None
     try:
         server, bound_port = start_test_server()
-        client = InferenceGrpcClient(f"localhost:{bound_port}", timeout=10)
+        client = InferenceGrpcClient(f"127.0.0.1:{bound_port}", timeout=10)
 
         model_id = client.load_model(
             model_id="integration-stream",

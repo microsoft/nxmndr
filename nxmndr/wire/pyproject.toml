@@ -1,0 +1,37 @@
+# nxmndr-wire: the host-side (QGIS) subset of nxmndr.
+#
+# Built by build_wire_dist.py from the SAME source files as the full nxmndr package
+# (no copied schema): the gRPC client, the generated bindings, the session protocol
+# types, the NPZ tensor-bundle codec, and the Hugging Face Hub search helpers with
+# the model-file constants. No torch, transformers, huggingface_hub, onnxruntime or
+# Pillow; NumPy 1.x and 2.x both work. Floors come from the generated code:
+# inference_pb2_grpc.py GRPC_GENERATED_VERSION 1.76.0 and inference_pb2.py
+# ValidateProtobufRuntimeVersion 6.31.1 (major 6). requests is imported by
+# nxmndr.huggingface.search (QGIS ships it; the installer uses --no-deps).
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nxmndr-wire"
+dynamic = ["version"]
+description = "nxmndr gRPC wire client, generated bindings and tensor-bundle codec (no ML runtime)"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [{name = "Microsoft Corporation"}]
+dependencies = [
+  "numpy",
+  "grpcio>=1.76.0",
+  "protobuf>=6.31.1,<7",
+  "requests",
+]
+
+[tool.setuptools]
+packages = ["nxmndr", "nxmndr.huggingface", "nxmndr.inference"]
+include-package-data = false
+
+[tool.setuptools.package-data]
+"nxmndr.inference" = ["inference_pb2.pyi", "inference.proto"]
+
+[tool.setuptools.dynamic]
+version = {attr = "nxmndr.__version__"}

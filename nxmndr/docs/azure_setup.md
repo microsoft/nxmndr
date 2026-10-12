@@ -131,6 +131,36 @@ print(result)
 4. **Set quotas** to prevent unexpected costs
 5. **Implement caching** for repeated analysis
 
+## Alternative: OpenAI Platform (non-Azure) via the proxy
+
+The `--azure-proxy` server can also front models on the OpenAI platform
+(`https://api.openai.com`) — useful when an Azure subscription has no quota for a
+model. Any endpoint whose URL host is `api.openai.com` is authenticated with
+`OPENAI_API_KEY` instead of Azure credentials, forwarded to `/v1/images/edits` or
+`/v1/chat/completions` (no `api-version`), and the deployment name is sent as the
+`model` field, replacing any `model` the client sends. The plugin-facing routes are
+unchanged, so the QGIS plugin only needs
+to be in proxy mode pointing at this server. `<PREFIX>_PROVIDER=openai` (or
+`azure_openai`) sets the identity explicitly for any host, for example a loopback test
+stub; without it the host decides as above. Routes and request shapes are defined in
+`nxmndr/server/proxy_routes.py`.
+
+```bash
+export OPENAI_API_KEY="sk-..."             # from platform.openai.com/api-keys
+export VISION_DEPLOYMENT_NAME="gpt-image-1" # any Image API model, e.g. gpt-image-2
+export VISION_ENDPOINT_URL="https://api.openai.com"
+export VISION_TYPE="vision"
+nxmndr-server --azure-proxy --http-port 8080
+```
+
+The proxy listens on 127.0.0.1 unless started with `--host`; it has no authentication
+and spends these credentials for every caller.
+
+No `az login` is needed for a proxy that only fronts OpenAI-platform endpoints; the
+Azure credential is created lazily on the first Azure-bound request. GPT Image
+models on the OpenAI platform may require completing API Organization Verification
+in the OpenAI developer console before first use.
+
 ## Additional Resources
 
 - [Azure OpenAI Documentation](https://docs.microsoft.com/azure/cognitive-services/openai/)

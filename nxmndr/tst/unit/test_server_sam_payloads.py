@@ -1,12 +1,28 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 
+"""Unary Predict payload handling, called in-process.
+
+SAM routing comes from the loaded model's capability (never its name), prompts use
+the flat v1 encoding (points ``[[x, y], ...]`` with matching 0/1 labels, one box),
+and malformed prompts are INVALID_ARGUMENT.
+"""
+
 import json
 
+import grpc
 import numpy as np
+import pytest
 
 from nxmndr.inference import inference_pb2
-from nxmndr.server import server
+from nxmndr.models import sam as sam_support
+from nxmndr.server import managers, server
+from tst.support.stream_doubles import (
+    CountingLoader,
+    CountingVariantLoader,
+    FakeHFSamModel,
+    NamedLikeSamModel,
+)
 
 
 class _DummyContext:
@@ -21,95 +37,114 @@ class _DummyContext:
         self.details = details
 
 
-class _DummyRecord:
-    def __init__(self):
-        self.model = None
-        self.backend = "onnx"
-        self.metadata = {"repo_id": "facebook/sam3", "token": "token"}
+def _service(tmp_path, factories, fmt=inference_pb2.ONNX, source="double://m"):
+    manager = managers.ModelManager(None, capacity=4, loader=CountingLoader(factories))
+    svc = server.InferenceService(model_cache_dir=tmp_path / "cache", model_manager=manager)
+    load = svc.LoadModel(
+        inference_pb2.LoadModelRequest(spec=inference_pb2.ModelSpec(format=fmt, source=source)),
+        _DummyContext(),
+    )
+    assert load.success, load.message
+    return svc, load.model_id
 
 
-class _DummyManager:
-    def __init__(self, record):
-        self._record = record
-
-    def get(self, model_id):
-        return self._record
-
-    def get_model_for_device(self, model_id, device_id):
-        return self._record.model if self._record else None
+@pytest.fixture
+def sam_log():
+    return []
 
 
-def test_predict_routes_sam_prompts(monkeypatch):
-    service = server.InferenceService()
-    record = _DummyRecord()
-    service.model_manager = _DummyManager(record)
+@pytest.fixture
+def variants(monkeypatch, sam_log):
+    loader = CountingVariantLoader(sam_log)
+    monkeypatch.setattr(sam_support, "load_sam_variant", loader)
+    return loader
 
-    captured = {}
 
-    def _fake_is_sam_model(model_id, model_spec):
-        captured["is_sam_model"] = (model_id, model_spec)
-        return True
+def _sam_service(tmp_path, sam_log, monkeypatch):
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    monkeypatch.delenv("HUGGINGFACE_TOKEN", raising=False)
+    return _service(
+        tmp_path,
+        {"double://sam3": lambda: (FakeHFSamModel(sam_log), "huggingface")},
+        fmt=inference_pb2.HUGGINGFACE,
+        source="double://sam3",
+    )
 
-    def _fake_handle_sam_inference(
-        model_id, model_spec, image_array, options, device, logger, token=None
-    ):
-        captured["options"] = dict(options)
-        captured["image_shape"] = image_array.shape
-        return np.array([[1, 2], [3, 4]], dtype=np.uint16)
 
-    monkeypatch.setattr(server, "is_sam_model", _fake_is_sam_model)
-    monkeypatch.setattr(server, "handle_sam_inference", _fake_handle_sam_inference)
-
-    arr = np.zeros((2, 2, 3), dtype=np.uint8)
+def test_predict_routes_sam_prompts(tmp_path, sam_log, variants, monkeypatch):
+    service, mid = _sam_service(tmp_path, sam_log, monkeypatch)
+    arr = np.zeros((16, 16, 3), dtype=np.uint8)
     req = inference_pb2.PredictRequest(
-        model_id="sam-model",
-        input=arr.tobytes(),
-        shape=list(arr.shape),
-        dtype=str(arr.dtype),
+        model_id=mid, input=arr.tobytes(), shape=list(arr.shape), dtype=str(arr.dtype)
     )
     req.options["sam_text_prompt"] = "tree"
-    req.options["sam_input_points"] = json.dumps([[[[10, 20]]]])
-    req.options["sam_input_labels"] = json.dumps([1])
-    req.options["sam_input_bbox"] = json.dumps([5, 5, 50, 50])
+    req.options["sam_input_points"] = json.dumps([[10, 12], [3, 4]])
+    req.options["sam_input_labels"] = json.dumps([1, 0])
+    req.options["sam_input_bbox"] = json.dumps([5, 5, 14, 14])
     req.options["task_type"] = "segmentation"
 
-    response = service.Predict(req, _DummyContext())
+    ctx = _DummyContext()
+    response = service.Predict(req, ctx)
+    assert ctx.code is None, ctx.details
 
-    assert captured["is_sam_model"][0] == "sam-model"
-    assert captured["options"]["sam_text_prompt"] == "tree"
-    assert json.loads(captured["options"]["sam_input_points"]) == [[[[10, 20]]]]
-    assert json.loads(captured["options"]["sam_input_labels"]) == [1]
-    assert json.loads(captured["options"]["sam_input_bbox"]) == [5, 5, 50, 50]
-    assert captured["image_shape"] == (2, 2, 3)
+    # geometry takes precedence over text; one object prompt with labels and a real box
+    [call] = [e for e in sam_log if e.get("kind") == "tracker" and "image_shape" in e]
+    assert call["image_shape"] == (16, 16, 3)
+    assert call["input_points"] == [[[[10.0, 12.0], [3.0, 4.0]]]]
+    assert call["input_labels"] == [[[1, 0]]]
+    assert call["input_boxes"] == [[[5.0, 5.0, 14.0, 14.0]]]
+    assert not [e for e in sam_log if e.get("kind") == "text" and "image_shape" in e]
 
     output = np.frombuffer(response.output, dtype=response.dtype).reshape(response.shape)
-    assert output.shape == (2, 2)
+    assert output.shape == (16, 16)
     assert output.dtype == np.uint16
-    assert np.array_equal(output, np.array([[1, 2], [3, 4]], dtype=np.uint16))
+    assert output[12, 10] == 1 and output[4, 3] == 0
     assert response.metadata.get("result_type") == "segmentation_mask"
+    assert response.metadata.get("sam_prompt") == "geometry"
 
 
-def test_predict_segmentation_mask_non_sam(monkeypatch):
-    service = server.InferenceService()
+def test_predict_malformed_sam_prompt_is_an_error(tmp_path, sam_log, variants, monkeypatch):
+    service, mid = _sam_service(tmp_path, sam_log, monkeypatch)
+    arr = np.zeros((16, 16, 3), dtype=np.uint8)
+    req = inference_pb2.PredictRequest(
+        model_id=mid, input=arr.tobytes(), shape=list(arr.shape), dtype=str(arr.dtype)
+    )
+    req.options["sam_input_points"] = "[[1, 2"  # malformed JSON
+    req.options["sam_input_labels"] = "[1]"
+    ctx = _DummyContext()
+    response = service.Predict(req, ctx)
+    assert ctx.code == grpc.StatusCode.INVALID_ARGUMENT
+    assert response.metadata["error_code"] == "malformed_options"
+    assert service.model_manager.get(mid).model.unprompted_calls == 0  # no silent fallback
 
+
+def test_predict_does_not_route_by_model_name(tmp_path, sam_log, variants):
+    service, mid = _service(
+        tmp_path, {"double://samples/sam3": lambda: (NamedLikeSamModel(), "onnx")},
+        source="double://samples/sam3",
+    )
+    arr = np.zeros((1, 3, 2, 2), dtype=np.float32)
+    req = inference_pb2.PredictRequest(
+        model_id=mid, input=arr.tobytes(), shape=list(arr.shape), dtype=str(arr.dtype)
+    )
+    req.options["sam_text_prompt"] = "field"
+    req.options["task_type"] = "segmentation"
+    response = service.Predict(req, _DummyContext())
+    assert "sam_prompt" not in response.metadata
+    assert sam_log == [] and sum(variants.calls.values()) == 0
+
+
+def test_predict_segmentation_mask_non_sam(tmp_path):
     class _Model:
         def predict(self, arr, return_embeddings=False):
             # Return a 2D mask directly; prepare_segmentation_mask will accept (H, W)
             return np.ones((2, 2), dtype=np.uint16)
 
-    class _Record:
-        def __init__(self):
-            self.model = _Model()
-            self.backend = "onnx"
-            self.metadata = {"task_name": "segmentation"}
-
-    service.model_manager = _DummyManager(_Record())
-
-    monkeypatch.setattr(server, "is_sam_model", lambda mid, meta: False)
+    service, mid = _service(tmp_path, {"double://m": lambda: (_Model(), "onnx")})
 
     arr = np.zeros((1, 3, 2, 2), dtype=np.float32)
     req = inference_pb2.PredictRequest(
-        model_id="seg-model",
+        model_id=mid,
         input=arr.tobytes(),
         shape=list(arr.shape),
         dtype=str(arr.dtype),
@@ -125,9 +160,7 @@ def test_predict_segmentation_mask_non_sam(monkeypatch):
     assert np.all(mask == 1)
 
 
-def test_predict_segmentation_mask_from_logits(monkeypatch):
-    service = server.InferenceService()
-
+def test_predict_segmentation_mask_from_logits(tmp_path):
     class _Model:
         def predict(self, arr, return_embeddings=False):
             # Return logits shaped (N, C, H, W); channel 1 wins everywhere.
@@ -139,18 +172,11 @@ def test_predict_segmentation_mask_from_logits(monkeypatch):
                 axis=1,
             )
 
-    class _Record:
-        def __init__(self):
-            self.model = _Model()
-            self.backend = "onnx"
-            self.metadata = {"task_name": "segmentation"}
-
-    service.model_manager = _DummyManager(_Record())
-    monkeypatch.setattr(server, "is_sam_model", lambda mid, meta: False)
+    service, mid = _service(tmp_path, {"double://m": lambda: (_Model(), "onnx")})
 
     arr = np.zeros((1, 3, 2, 2), dtype=np.float32)
     req = inference_pb2.PredictRequest(
-        model_id="seg-model",
+        model_id=mid,
         input=arr.tobytes(),
         shape=list(arr.shape),
         dtype=str(arr.dtype),

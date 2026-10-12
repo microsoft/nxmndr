@@ -34,10 +34,28 @@ Required per endpoint:
 Optional per endpoint:
 - <PREFIX>_API_VERSION: API version (fallback: API_VERSION, default: 2025-01-01-preview)
 - <PREFIX>_TYPE: Model type "chat" or "vision" (default: "chat")
+- <PREFIX>_PROVIDER: "openai" or "azure_openai" (default: detected from the host)
 
 Global Fallbacks:
 - ENDPOINT_URL: Default endpoint URL when specific endpoint URLs not configured
 - API_VERSION: Default API version when specific versions not configured
+
+OpenAI Platform (non-Azure) endpoints:
+An endpoint is served as the OpenAI platform when ``<PREFIX>_PROVIDER=openai``, or,
+when no provider is set, when its URL host is ``api.openai.com``
+(``<PREFIX>_PROVIDER=azure_openai`` forces Azure OpenAI for any host). For such
+endpoints the proxy authenticates with the
+``OPENAI_API_KEY`` environment variable (no Azure credential is needed), forwards to
+``/v1/chat/completions`` or ``/v1/images/edits`` instead of the
+``/openai/deployments/{deployment}/...`` paths, omits ``api-version``, and sends the
+deployment name as the ``model`` field. The client-facing routes are unchanged, so
+the QGIS plugin needs no reconfiguration beyond pointing at this proxy. Routes,
+identities and upstream shapes are defined once in ``nxmndr.server.proxy_routes``.
+
+  export OPENAI_API_KEY="sk-..."
+  export VISION_DEPLOYMENT_NAME="gpt-image-1"
+  export VISION_ENDPOINT_URL="https://api.openai.com"
+  export VISION_TYPE="vision"
 
 Routing Logic:
 1. Extract deployment name from request URL path
@@ -80,9 +98,21 @@ from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 
 from nxmndr.gpt.models import ModelEndpointSpec
 
+from . import proxy_routes
+
 # Configure logging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
+
+# Hosts that are served by the OpenAI platform rather than Azure OpenAI (used only
+# when an endpoint has no explicit provider).
+OPENAI_PLATFORM_HOSTS = proxy_routes.OPENAI_PLATFORM_HOSTS
+
+
+def is_openai_platform(endpoint_spec: ModelEndpointSpec) -> bool:
+    """Return True if the endpoint targets the OpenAI platform instead of Azure OpenAI."""
+    provider = proxy_routes.resolve_provider(endpoint_spec.endpoint_url, endpoint_spec.provider)
+    return provider == proxy_routes.PROVIDER_OPENAI
 
 
 class AzureOpenAIProxy:
@@ -110,20 +140,22 @@ class AzureOpenAIProxy:
             list(self.vision_endpoints.values())
         )
 
-        # Validate we have at least one endpoint of each type
+        # Warn (rather than fail) when a type has no endpoint; requests for that type return 503.
+        # Discovery already guarantees at least one endpoint overall.
         if not self.default_chat_endpoint:
-            raise ValueError(
-                "No chat endpoints found. Please set environment variables with pattern: <PREFIX>_DEPLOYMENT_NAME"
+            logger.warning(
+                "No chat endpoints configured; chat completions requests will be rejected. "
+                "Set <PREFIX>_DEPLOYMENT_NAME with <PREFIX>_TYPE=chat to enable them."
             )
         if not self.default_vision_endpoint:
-            raise ValueError(
-                "No vision endpoints found. Please set environment variables with pattern: <PREFIX>_DEPLOYMENT_NAME"
+            logger.warning(
+                "No vision endpoints configured; image edits requests will be rejected. "
+                "Set <PREFIX>_DEPLOYMENT_NAME with <PREFIX>_TYPE=vision to enable them."
             )
 
-        # Initialize Azure credential provider
-        self.token_provider = get_bearer_token_provider(
-            DefaultAzureCredential(), "https://cognitiveservices.azure.com/.default"
-        )
+        # Azure credential provider is created lazily on first Azure request, so a proxy
+        # that only fronts OpenAI-platform endpoints can start without Azure credentials.
+        self._azure_token_provider = None
 
         # HTTP client session
         self.session: Optional[ClientSession] = None
@@ -131,9 +163,16 @@ class AzureOpenAIProxy:
         # Log discovered endpoints
         logger.info(f"Initialized Azure OpenAI proxy with {len(self.model_endpoints)} endpoints:")
         for deployment_name, endpoint in self.model_endpoints.items():
-            logger.info(f"  {deployment_name}: {endpoint}")
-        logger.info(f"Default chat endpoint: {self.default_chat_endpoint.deployment_name}")
-        logger.info(f"Default vision endpoint: {self.default_vision_endpoint.deployment_name}")
+            provider = "openai-platform" if is_openai_platform(endpoint) else "azure"
+            logger.info(f"  {deployment_name}: {endpoint} [{provider}]")
+        logger.info(
+            f"Default chat endpoint: "
+            f"{self.default_chat_endpoint.deployment_name if self.default_chat_endpoint else 'none'}"
+        )
+        logger.info(
+            f"Default vision endpoint: "
+            f"{self.default_vision_endpoint.deployment_name if self.default_vision_endpoint else 'none'}"
+        )
 
     def _discover_model_endpoints(self) -> List[ModelEndpointSpec]:
         """Discover ModelEndpointSpec instances from environment variables."""
@@ -155,6 +194,7 @@ class AzureOpenAIProxy:
                 endpoint_url_key = f"{prefix}_ENDPOINT_URL"
                 api_version_key = f"{prefix}_API_VERSION"
                 type_key = f"{prefix}_TYPE"
+                provider_key = f"{prefix}_PROVIDER"
 
                 endpoint_url = os.getenv(endpoint_url_key)
                 if not endpoint_url:
@@ -185,6 +225,7 @@ class AzureOpenAIProxy:
                     deployment_name=deployment_name,
                     api_version=api_version,
                     type=endpoint_type,
+                    provider=os.getenv(provider_key, "").strip().lower(),
                 )
 
                 # Validate the spec
@@ -272,16 +313,34 @@ class AzureOpenAIProxy:
             self.session = None
             logger.info("HTTP client session closed")
 
-    def _get_auth_headers(self) -> dict:
-        """Get authentication headers with Bearer token."""
-        token = self.token_provider()
+    @property
+    def token_provider(self):
+        """Azure bearer-token provider, created on first use."""
+        if self._azure_token_provider is None:
+            self._azure_token_provider = get_bearer_token_provider(
+                DefaultAzureCredential(), "https://cognitiveservices.azure.com/.default"
+            )
+        return self._azure_token_provider
+
+    def _get_auth_headers(self, endpoint_spec: ModelEndpointSpec) -> dict:
+        """Get authentication headers for the given endpoint (API key for OpenAI, Azure token otherwise)."""
+        if is_openai_platform(endpoint_spec):
+            api_key = os.getenv("OPENAI_API_KEY")
+            if not api_key:
+                raise RuntimeError(
+                    f"Endpoint {endpoint_spec.deployment_name} targets the OpenAI platform but "
+                    "OPENAI_API_KEY is not set"
+                )
+            token = api_key
+        else:
+            token = self.token_provider()
         return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
     async def _forward_request(
         self,
         endpoint_spec: ModelEndpointSpec,
         method: str,
-        path: str,
+        operation: str,
         request_data: dict = None,
         files: dict = None,
         params: dict = None,
@@ -292,7 +351,7 @@ class AzureOpenAIProxy:
         Args:
             endpoint_spec: The ModelEndpointSpec to use for the request
             method: HTTP method (GET, POST, etc.)
-            path: API path relative to endpoint
+            operation: proxy_routes.OPERATION_CHAT_COMPLETIONS or OPERATION_IMAGE_EDITS
             request_data: JSON request body
             files: File uploads for multipart requests
             params: Query parameters
@@ -302,16 +361,30 @@ class AzureOpenAIProxy:
         """
         await self.start_session()
 
-        # Build full URL
-        url = f"{endpoint_spec.endpoint_url}/{path.lstrip('/')}"
+        # Upstream URL, query and body fields for the endpoint's provider identity:
+        # Azure OpenAI requires api-version (the OpenAI platform rejects it); the
+        # OpenAI platform selects the model per request instead of per deployment URL.
+        upstream = proxy_routes.upstream_request(
+            endpoint_spec.endpoint_url,
+            endpoint_spec.deployment_name,
+            operation,
+            provider=endpoint_spec.provider,
+            api_version=endpoint_spec.api_version,
+        )
+        url = upstream.url
 
-        # Add API version to params
         if params is None:
             params = {}
-        params["api-version"] = endpoint_spec.api_version
+        params.update(upstream.params)
 
         # Get authentication headers
-        headers = self._get_auth_headers()
+        headers = self._get_auth_headers(endpoint_spec)
+
+        if upstream.fields:
+            if request_data is None:
+                request_data = {}
+            for key, value in upstream.fields.items():
+                request_data[key] = value  # the routed endpoint decides, not the client
 
         try:
             logger.info(f"Forwarding {method} request to: {url}")
@@ -368,6 +441,16 @@ class AzureOpenAIProxy:
             if not endpoint_spec:
                 # Fall back to default chat endpoint but use the requested deployment name
                 endpoint_spec = self.default_chat_endpoint
+                if not endpoint_spec:
+                    return web.json_response(
+                        {
+                            "error": {
+                                "message": "No chat endpoints are configured on this proxy",
+                                "type": "configuration_error",
+                            }
+                        },
+                        status=503,
+                    )
                 logger.info(
                     f"Deployment '{deployment}' not found, using default chat endpoint: {endpoint_spec.deployment_name}"
                 )
@@ -387,11 +470,10 @@ class AzureOpenAIProxy:
             if "temperature" in request_data:
                 logger.debug(f"Temperature: {request_data['temperature']}")
 
-            # Forward to Azure OpenAI using the selected endpoint
+            # Forward using the selected endpoint
             # Use the actual endpoint's deployment name, not the requested one
-            path = f"openai/deployments/{endpoint_spec.deployment_name}/chat/completions"
             status, response_data = await self._forward_request(
-                endpoint_spec, "POST", path, request_data
+                endpoint_spec, "POST", proxy_routes.OPERATION_CHAT_COMPLETIONS, request_data
             )
 
             logger.info(f"Chat completions request completed with status: {status}")
@@ -429,6 +511,16 @@ class AzureOpenAIProxy:
             if not endpoint_spec:
                 # Fall back to default vision endpoint but use the requested deployment name
                 endpoint_spec = self.default_vision_endpoint
+                if not endpoint_spec:
+                    return web.json_response(
+                        {
+                            "error": {
+                                "message": "No vision endpoints are configured on this proxy",
+                                "type": "configuration_error",
+                            }
+                        },
+                        status=503,
+                    )
                 logger.info(
                     f"Deployment '{deployment}' not found, using default vision endpoint: {endpoint_spec.deployment_name}"
                 )
@@ -469,11 +561,10 @@ class AzureOpenAIProxy:
                 f"Processing image edit with {len(form_data)} form fields and image size {image_size} bytes"
             )
 
-            # Forward to Azure OpenAI using the selected endpoint
+            # Forward using the selected endpoint
             # Use the actual endpoint's deployment name, not the requested one
-            path = f"openai/deployments/{endpoint_spec.deployment_name}/images/edits"
             status, response_data = await self._forward_request(
-                endpoint_spec, "POST", path, form_data, files
+                endpoint_spec, "POST", proxy_routes.OPERATION_IMAGE_EDITS, form_data, files
             )
 
             logger.info(f"Image edits request completed with status: {status}")
@@ -507,10 +598,20 @@ class AzureOpenAIProxy:
             ) or self.get_endpoint_by_deployment(deployment, "chat")
 
             if not endpoint_spec:
-                # Fall back to default vision endpoint
-                endpoint_spec = self.default_vision_endpoint
+                # Fall back to default vision endpoint, then default chat endpoint
+                endpoint_spec = self.default_vision_endpoint or self.default_chat_endpoint
+                if not endpoint_spec:
+                    return web.json_response(
+                        {
+                            "error": {
+                                "message": "No endpoints are configured on this proxy",
+                                "type": "configuration_error",
+                            }
+                        },
+                        status=503,
+                    )
                 logger.info(
-                    f"Deployment '{deployment}' not found, using default vision endpoint: {endpoint_spec.deployment_name}"
+                    f"Deployment '{deployment}' not found, using default endpoint: {endpoint_spec.deployment_name}"
                 )
 
             logger.info(f"Using endpoint: {endpoint_spec} (type: {endpoint_spec.type})")
@@ -541,7 +642,7 @@ class AzureOpenAIProxy:
         """Handle list registered models API requests."""
         try:
             # Get optional type filter from query parameters
-            model_type = request.query.get("type")  # 'chat', 'vision', or None for all
+            model_type = request.query.get(proxy_routes.MODELS_TYPE_PARAM)  # 'chat', 'vision', or None for all
 
             logger.info(f"Handling list models request (type filter: {model_type or 'all'})")
 
@@ -637,17 +738,15 @@ def setup_azure_proxy_routes(app: web.Application, proxy: AzureOpenAIProxy):
     app["azure_proxy"] = proxy
 
     # Azure OpenAI API compatible routes
-    app.router.add_post(
-        "/openai/deployments/{deployment}/chat/completions", proxy.handle_chat_completions
-    )
-    app.router.add_post("/openai/deployments/{deployment}/images/edits", proxy.handle_image_edits)
+    app.router.add_post(proxy_routes.ROUTE_CHAT_COMPLETIONS, proxy.handle_chat_completions)
+    app.router.add_post(proxy_routes.ROUTE_IMAGE_EDITS, proxy.handle_image_edits)
 
     # Unified client-facing routes
-    app.router.add_post("/generate/image/{deployment}", proxy.handle_image_generation)
+    app.router.add_post(proxy_routes.ROUTE_GENERATE_IMAGE, proxy.handle_image_generation)
 
     # Proxy management routes
-    app.router.add_get("/models", proxy.handle_list_models)  # List registered models
-    app.router.add_get("/health", proxy.handle_health)
+    app.router.add_get(proxy_routes.ROUTE_MODELS, proxy.handle_list_models)  # List registered models
+    app.router.add_get(proxy_routes.ROUTE_HEALTH, proxy.handle_health)
 
     # Add cleanup handler
     async def cleanup_azure_proxy(app):
@@ -675,7 +774,14 @@ def create_app() -> web.Application:
     return app
 
 
-async def run_server(host: str = "0.0.0.0", port: int = 8080):
+def http_bind_host(host: str) -> str:
+    """``host`` as aiohttp binds it: without the brackets of an IPv6 address."""
+    if host.startswith("[") and host.endswith("]"):
+        return host[1:-1]
+    return host
+
+
+async def run_server(host: str = "127.0.0.1", port: int = 8080):
     """
     Run the Azure OpenAI proxy server.
 
@@ -691,7 +797,7 @@ async def run_server(host: str = "0.0.0.0", port: int = 8080):
     runner = web.AppRunner(app)
     await runner.setup()
 
-    site = web.TCPSite(runner, host, port)
+    site = web.TCPSite(runner, http_bind_host(host), port)
     await site.start()
 
     logger.info("Server started successfully")
@@ -712,7 +818,12 @@ def main():
     parser = argparse.ArgumentParser(
         description="Azure OpenAI API Proxy Server - Automatically discovers endpoints from environment variables"
     )
-    parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Host to bind to (default: 127.0.0.1). The proxy has no authentication and "
+        "spends its own credentials: expose it only on a trusted network.",
+    )
     parser.add_argument("--port", type=int, default=8080, help="Port to bind to")
 
     args = parser.parse_args()

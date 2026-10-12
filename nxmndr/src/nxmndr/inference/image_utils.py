@@ -1,13 +1,14 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 
-import io
 import json
 from pathlib import Path
-from typing import Dict, Iterable, Mapping, MutableMapping, Sequence, Tuple, Union
+from typing import Dict, Iterable, MutableMapping, Sequence, Tuple, Union
 
 import numpy as np
 from PIL import Image
+
+from ..tensor_bundle import pack_tensor_bundle, unpack_tensor_bundle
 
 
 def load_images_to_batch(
@@ -41,6 +42,33 @@ def load_images_to_batch(
     return np.stack(arrays, axis=0)
 
 
+UINT16_MAX = 65535
+
+
+def _label_mask(arr: np.ndarray) -> np.ndarray:
+    """``arr`` as a ``uint16`` class-label map, refusing values a cast would change.
+
+    Labels must be whole numbers in ``[0, 65535]``. A negative or larger value, a
+    fractional value, NaN or infinity raises ``ValueError`` instead of wrapping or
+    truncating (an identity output of 65536 became label 0 before). The dispatcher then
+    returns the prediction unchanged as a ``raw`` result with a ``task_warning``.
+    """
+
+    if arr.dtype == np.uint16:
+        return arr
+    if arr.dtype.kind == "b":
+        return arr.astype(np.uint16)
+    if arr.dtype.kind not in "iuf":
+        raise ValueError(f"segmentation labels must be numeric, got dtype {arr.dtype}")
+    if arr.size:
+        if arr.dtype.kind == "f" and not (np.isfinite(arr).all() and np.array_equal(arr, np.floor(arr))):
+            raise ValueError("segmentation output has fractional or non-finite values; it is not a label map")
+        low, high = arr.min(), arr.max()
+        if low < 0 or high > UINT16_MAX:
+            raise ValueError(f"segmentation labels span [{low}, {high}], outside the uint16 range [0, {UINT16_MAX}]")
+    return arr.astype(np.uint16, copy=False)
+
+
 def prepare_segmentation_mask_with_confidence(
     prediction: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -56,6 +84,9 @@ def prepare_segmentation_mask_with_confidence(
         Tuple of (mask, confidence) where:
         - mask: uint16 array of shape (H, W) with class labels
         - confidence: float32 array of shape (H, W) with confidence scores (0-1)
+
+    Raises ``ValueError`` for unsupported shapes and for labels that are not whole
+    numbers in ``[0, 65535]`` (``_label_mask``).
     """
     arr = np.asarray(prediction)
 
@@ -66,7 +97,7 @@ def prepare_segmentation_mask_with_confidence(
             result = arr.squeeze()
             if result.ndim != 2:
                 raise ValueError(f"Unexpected shape after squeeze: {result.shape} from {arr.shape}")
-            mask = result.astype(np.uint16, copy=False)
+            mask = _label_mask(result)
             confidence = np.ones_like(mask, dtype=np.float32)
             return mask, confidence
         else:
@@ -80,7 +111,7 @@ def prepare_segmentation_mask_with_confidence(
             exp_arr = np.exp(arr - arr.max(axis=0, keepdims=True))  # Numerical stability
             softmax = exp_arr / exp_arr.sum(axis=0, keepdims=True)
             # Argmax for class labels
-            mask = np.argmax(arr, axis=0).astype(np.uint16)
+            mask = _label_mask(np.argmax(arr, axis=0))
             # Max softmax value as confidence
             confidence = softmax.max(axis=0).astype(np.float32)
             return mask, confidence
@@ -90,19 +121,19 @@ def prepare_segmentation_mask_with_confidence(
             # Already integer mask
             if arr.shape[0] == 1:
                 arr = arr.squeeze(0)
-            mask = arr.astype(np.uint16, copy=False)
+            mask = _label_mask(arr)
             confidence = np.ones_like(mask, dtype=np.float32)
             return mask, confidence
         # Multi-channel logits (C, H, W)
         exp_arr = np.exp(arr - arr.max(axis=0, keepdims=True))
         softmax = exp_arr / exp_arr.sum(axis=0, keepdims=True)
-        mask = np.argmax(arr, axis=0).astype(np.uint16)
+        mask = _label_mask(np.argmax(arr, axis=0))
         confidence = softmax.max(axis=0).astype(np.float32)
         return mask, confidence
 
     if arr.ndim == 2:
         # Already a mask
-        mask = arr.astype(np.uint16, copy=False)
+        mask = _label_mask(arr)
         confidence = np.ones_like(mask, dtype=np.float32)
         return mask, confidence
 
@@ -114,7 +145,8 @@ def prepare_segmentation_mask(prediction: np.ndarray) -> np.ndarray:
 
     Accepts tensors shaped (N, C, H, W), (C, H, W), (N, H, W) or (H, W) and returns
     an array shaped (H, W) with ``uint16`` dtype representing the winning class
-    per pixel. Raises ``ValueError`` for unsupported shapes.
+    per pixel. Raises ``ValueError`` for unsupported shapes and for labels that are
+    not whole numbers in ``[0, 65535]`` (``_label_mask``): nothing wraps or truncates.
     """
 
     arr = np.asarray(prediction)
@@ -126,26 +158,26 @@ def prepare_segmentation_mask(prediction: np.ndarray) -> np.ndarray:
             result = arr.squeeze()
             if result.ndim != 2:
                 raise ValueError(f"Unexpected shape after squeeze: {result.shape} from {arr.shape}")
-            return result.astype(np.uint16, copy=False)
+            return _label_mask(result)
         else:
             # Multi-channel logits - argmax and squeeze batch dim
             result = np.argmax(arr, axis=1)
             if result.shape[0] == 1:
                 result = result.squeeze(0)
-            return result.astype(np.uint16, copy=False)
+            return _label_mask(result)
 
     if arr.ndim == 3:
         if arr.dtype.kind in ("i", "u"):
             # Already integer mask, squeeze if batch dim is 1
             if arr.shape[0] == 1:
-                return arr.squeeze(0).astype(np.uint16, copy=False)
-            return arr.astype(np.uint16, copy=False)
+                return _label_mask(arr.squeeze(0))
+            return _label_mask(arr)
         # Multi-channel logits (C, H, W) - argmax along channel dim
-        mask = np.argmax(arr, axis=0).astype(np.uint16, copy=False)
+        mask = _label_mask(np.argmax(arr, axis=0))
         return mask
 
     if arr.ndim == 2:
-        return arr.astype(np.uint16, copy=False)
+        return _label_mask(arr)
 
     raise ValueError(f"Unsupported segmentation prediction shape: {arr.shape}")
 
@@ -200,29 +232,6 @@ __all__ = [
     "parse_geotransform",
     "boxes_to_polygons",
 ]
-
-
-def pack_tensor_bundle(tensors: Mapping[str, np.ndarray]) -> bytes:
-    """Serialize a mapping of numpy arrays into a compressed NPZ payload."""
-
-    if not tensors:
-        raise ValueError("Tensor bundle cannot be empty")
-
-    buffer = io.BytesIO()
-    np.savez_compressed(buffer, **{key: np.ascontiguousarray(val) for key, val in tensors.items()})
-    buffer.seek(0)
-    return buffer.read()
-
-
-def unpack_tensor_bundle(payload: bytes) -> Dict[str, np.ndarray]:
-    """Deserialize a compressed NPZ payload into numpy arrays."""
-
-    if not payload:
-        return {}
-
-    buffer = io.BytesIO(payload)
-    with np.load(buffer, allow_pickle=False) as data:
-        return {key: data[key] for key in data.files}
 
 
 def parse_geotransform(

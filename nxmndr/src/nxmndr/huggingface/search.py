@@ -6,15 +6,18 @@ from __future__ import annotations
 import json
 import logging
 from pprint import pformat
-from typing import Dict, List, Optional, Sequence, Iterable, Any
+from typing import TYPE_CHECKING, Dict, List, Optional, Sequence, Iterable, Any
 from dataclasses import dataclass, field
 
 import requests
-from huggingface_hub import HfApi
 
-# Internal model spec
-from nxmndr.models.models import HuggingFaceModelSpec
 from nxmndr.constants import get_extension_rank
+
+# huggingface_hub and nxmndr.models (torch) are imported only by the functions that
+# use them, so this module imports on a host without the ML runtime (it ships in
+# the nxmndr-wire distribution).
+if TYPE_CHECKING:
+    from nxmndr.models.models import HuggingFaceModelSpec
 
 """Utility helpers for searching HuggingFace Hub models.
 
@@ -23,7 +26,6 @@ models REST API as well as a convenience helper for checking if a model is
 likely usable for inference (i.e. it exposes a pipeline tag).
 """
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 DEFAULT_TIMEOUT_SECONDS = 10
@@ -46,6 +48,8 @@ def hf_model_supports_inference(model_id: str) -> bool:
     A missing tag does not always mean unusable (custom architectures may still
     work) but this serves as a quick heuristic.
     """
+    from huggingface_hub import HfApi
+
     try:
         api = HfApi()
         info = api.model_info(model_id)
@@ -282,6 +286,8 @@ class HFModelSearchResult:
 
     # Backwards compatible adapter
     def to_spec(self, require_weights: bool = True) -> Optional[HuggingFaceModelSpec]:
+        from nxmndr.models.models import HuggingFaceModelSpec
+
         filename = _select_primary_weight_file(self.siblings)
         if not filename and require_weights:
             return None
@@ -314,6 +320,9 @@ __all__ = [
 
 
 if __name__ == "__main__":  # Manual quick test
+    # Configured here, not at import: a host process that imports this module keeps
+    # its own logging configuration.
+    logging.basicConfig(level=logging.INFO)
     query = "landsat"
     response = search_huggingface_models(query, limit=5)
     log_search_results(response.models)

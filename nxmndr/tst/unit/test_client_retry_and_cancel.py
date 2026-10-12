@@ -12,6 +12,9 @@ class _FakeRpcError(grpc.RpcError):
         super().__init__()
         self._message = message
 
+    def code(self):
+        return grpc.StatusCode.UNAVAILABLE
+
     def details(self):
         return self._message
 

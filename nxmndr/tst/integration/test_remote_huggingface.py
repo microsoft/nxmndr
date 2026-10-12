@@ -2,6 +2,8 @@
 # Licensed under the MIT License.
 
 import logging
+import os
+
 import numpy as np
 import pytest
 
@@ -19,6 +21,14 @@ logger = logging.getLogger(__name__)
 
 MODEL_ID = "satejsoman/nxmndr-test"
 SAM_MODEL_ID = "facebook/sam-vit-base"
+
+# These tests load real models from the Hugging Face hub. The server's cache is the
+# test's temporary directory (tst/conftest.py), so they need network access; they
+# run only when NXMNDR_TEST_HF_HUB=1 (and HF_HUB_OFFLINE is not set).
+pytestmark = pytest.mark.skipif(
+    os.environ.get("NXMNDR_TEST_HF_HUB", "").strip() != "1",
+    reason="needs the Hugging Face hub; set NXMNDR_TEST_HF_HUB=1 to run",
+)
 
 
 def _assert_remote_hf_registration(
