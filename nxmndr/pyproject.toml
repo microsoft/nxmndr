@@ -49,7 +49,7 @@ Issues = "https://github.com/microsoft/nxmndr/issues"
 [project.optional-dependencies]
 # Extra for running the unified server with HTTP + Azure proxy endpoints
 server = [
-  "aiohttp==3.13.4",
+  "aiohttp==3.14.3",
   "azure-identity==1.25.3",
   "openai==2.29.0",
 ]
