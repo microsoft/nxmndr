@@ -240,6 +240,20 @@ class TestOpenAIChatGptVisionProvider:
         mock_openai.assert_called_once_with(api_key="test-key", timeout=30)
         mock_client.models.list.assert_called_once()
 
+    @patch("openai.OpenAI")
+    def test_get_client_passes_organization_and_project(self, mock_openai):
+        """An explicit project reaches the OpenAI client beside the organization."""
+        mock_client = Mock()
+        mock_openai.return_value = mock_client
+        mock_client.models.list.return_value = []
+
+        provider = OpenAIChatGptVisionProvider(api_key="test-key", organization="org-1", project="proj-1")
+        provider._get_client()
+
+        mock_openai.assert_called_once_with(
+            api_key="test-key", timeout=30, organization="org-1", project="proj-1"
+        )
+
 
 class TestAzureChatGptVisionProvider:
     """Test Azure OpenAI-specific ChatGPT Vision inference provider."""

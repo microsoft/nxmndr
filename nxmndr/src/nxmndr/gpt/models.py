@@ -17,6 +17,7 @@ from PIL import Image
 from ..exceptions import PredictionError, ValidationError
 from ..logging import get_logger
 from ..models import Model, ModelSpec
+from ..server.proxy_routes import PROVIDERS
 from ..tasks import Task
 
 logger = get_logger(__name__)
@@ -28,12 +29,18 @@ JPEG_ENCODE_QUALITY = 95  # JPEG quality for base64 encoding
 
 @dataclass
 class ModelEndpointSpec(ModelSpec):
-    """Specification for Azure OpenAI endpoint configuration."""
+    """Specification for Azure OpenAI endpoint configuration.
+
+    ``provider`` is the explicit identity, ``"openai"`` or ``"azure_openai"``; empty
+    (the default) detects it from the endpoint's host
+    (``nxmndr.server.proxy_routes.resolve_provider``).
+    """
 
     endpoint_url: str
     deployment_name: str
     api_version: str
     type: Literal["chat", "vision"] = "chat"
+    provider: str = ""
 
     @classmethod
     def from_json(cls, json_str: str):
@@ -44,6 +51,7 @@ class ModelEndpointSpec(ModelSpec):
             deployment_name=d["deployment_name"],
             api_version=d.get("api_version", "2025-01-01-preview"),
             type=d.get("type", "chat"),
+            provider=d.get("provider", ""),
         )
 
     def validate(self):
@@ -56,6 +64,8 @@ class ModelEndpointSpec(ModelSpec):
             raise ValidationError("api_version is required")
         if self.type not in ["chat", "vision"]:
             raise ValidationError("type must be either 'chat' or 'vision'")
+        if self.provider and self.provider not in PROVIDERS:
+            raise ValidationError(f"provider must be one of {PROVIDERS} or empty")
 
         # Basic URL validation
         if not (
@@ -70,6 +80,7 @@ class ModelEndpointSpec(ModelSpec):
             "deployment_name": self.deployment_name,
             "api_version": self.api_version,
             "type": self.type,
+            "provider": self.provider,
         }
 
     def __str__(self) -> str:

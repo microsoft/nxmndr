@@ -89,6 +89,7 @@ from nxmndr.gpt import OpenAIChatGptVisionProvider
 provider = OpenAIChatGptVisionProvider(
     api_key="your-openai-api-key",
     organization="your-org-id",  # Optional
+    project="your-project-id",   # Optional; if omitted the openai client reads OPENAI_PROJECT_ID
     timeout=60
 )
 ```

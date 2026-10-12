@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import uuid
@@ -18,8 +19,20 @@ from ..logging import get_logger
 logger = get_logger(__name__)
 
 
-_DEFAULT_REGISTRY_PATH = Path.home() / ".cache" / "nxmndr" / "model_registry.json"
-_DEFAULT_ARTIFACT_ROOT = Path.home() / ".cache" / "nxmndr" / "models"
+CACHE_DIR_ENV = "NXMNDR_CACHE_DIR"
+
+
+def default_cache_root() -> Path:
+    """``$NXMNDR_CACHE_DIR`` if set, else ``~/.cache/nxmndr``. Read on each call.
+
+    Holds the registry file (``model_registry.json``) and the default model
+    artifact directory (``models/``). Tests point it at a temporary directory.
+    """
+
+    configured = os.environ.get(CACHE_DIR_ENV, "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".cache" / "nxmndr"
 
 
 @dataclass
@@ -70,9 +83,9 @@ class ModelRegistryStore:
         *,
         artifact_root: Path | None = None,
     ) -> None:
-        self._path = Path(path) if path else _DEFAULT_REGISTRY_PATH
+        self._path = Path(path) if path else default_cache_root() / "model_registry.json"
         self._artifact_root = (
-            Path(artifact_root) if artifact_root else _DEFAULT_ARTIFACT_ROOT
+            Path(artifact_root) if artifact_root else default_cache_root() / "models"
         )
         self._lock = threading.Lock()
         self._entries: Dict[str, RegistryEntry] = {}

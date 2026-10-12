@@ -24,12 +24,14 @@ conda activate nxmndr
 cd nxmndr/
 pip install -e .[server,dev]
 
-# Start the gRPC inference server (default port: 50051)
+# Start the gRPC inference server (default: 127.0.0.1:50051, this machine only)
 nxmndr-server
 
-# Or specify a custom gRPC port and enable the Azure OpenAI proxy
+# Or specify a custom gRPC port and enable the Azure OpenAI proxy (also on 127.0.0.1)
 nxmndr-server --grpc-port 50051 --azure-proxy --http-port 8080
 ```
+
+To accept connections from other machines add `--host 0.0.0.0`; read [Security](nxmndr/README.md#security) first.
 
 ## Usage
 
@@ -79,6 +81,7 @@ mypy src/
 ## Documentation
 
 - [Server README](nxmndr/README.md) - Installation, API documentation, gRPC/Torch RPC details
+- [Changelog](nxmndr/CHANGELOG.md) - Breaking changes for clients and operators
 - [Azure OpenAI Setup](nxmndr/docs/azure_setup.md) - Azure proxy configuration
 - [ChatGPT Vision Guide](nxmndr/docs/chatgpt_vision.md) - Vision model integration
 

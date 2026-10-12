@@ -143,11 +143,15 @@ class ExampleConvModel(PreTrainedModel):
         return {"loss": loss, "logits": logits}
 
 
-def export(target_dir: str | Path | None = None):
+def export(target_dir: str | Path | None = None, seed: int | None = None):
     """Export artifacts into target_dir (defaults to tst/example_model).
 
     If the default PyTorch artifact already exists in tst/example_model, reuse it
     to avoid recreating test fixtures.
+
+    ``seed``: when given, ``torch.manual_seed(seed)`` runs before the model is
+    constructed, so the weights (and the export input) are the same on every run
+    and every machine. tst/conftest.py pins it.
     """
     base_dir = Path(target_dir) if target_dir is not None else cwd
     base_dir.mkdir(parents=True, exist_ok=True)
@@ -159,6 +163,8 @@ def export(target_dir: str | Path | None = None):
     if target_dir is None and PYTORCH_PATH.exists():
         return
 
+    if seed is not None:
+        torch.manual_seed(seed)
     model = ExampleModel().eval()
     dummy_input = torch.randn(1, 3, 32, 32)
 

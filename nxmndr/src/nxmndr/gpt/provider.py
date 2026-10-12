@@ -305,6 +305,7 @@ class OpenAIChatGptVisionProvider(ChatGptVisionInferenceProvider):
         organization: Optional[str] = None,
         base_url: Optional[str] = None,
         timeout: int = 30,
+        project: Optional[str] = None,
     ):
         """
         Initialize OpenAI ChatGPT Vision inference provider.
@@ -314,12 +315,15 @@ class OpenAIChatGptVisionProvider(ChatGptVisionInferenceProvider):
             organization: OpenAI organization ID. If None, reads from OPENAI_ORG_ID env var
             base_url: Custom API base URL. If None, uses OpenAI default
             timeout: Request timeout in seconds
+            project: OpenAI project ID, sent as the client's ``project``. If None, the
+                openai client reads OPENAI_PROJECT_ID itself
         """
         super().__init__(timeout=timeout)
 
         # API credential management
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         self.organization = organization or os.getenv("OPENAI_ORG_ID")
+        self.project = project
         self.base_url = base_url
 
         logger.info("Initialized OpenAI ChatGPT Vision provider")
@@ -340,6 +344,8 @@ class OpenAIChatGptVisionProvider(ChatGptVisionInferenceProvider):
 
                 if self.organization:
                     client_kwargs["organization"] = self.organization
+                if self.project:
+                    client_kwargs["project"] = self.project
                 if self.base_url:
                     client_kwargs["base_url"] = self.base_url
 

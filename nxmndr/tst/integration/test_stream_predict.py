@@ -37,6 +37,14 @@ def test_stream_predict_round_trip(tmp_path):
             assert load_resp.success
             model_id = load_resp.model_id
 
+            # A session stream needs a session opened with OpenSession (no fabricated sessions).
+            open_resp = stub.OpenSession(
+                inference_pb2.OpenSessionRequest(
+                    session_id="sessB", spec=inference_pb2.ModelSpec(model_id=model_id)
+                )
+            )
+            assert open_resp.status == "ok"
+
             arr = np.zeros((1, 3, 32, 32), dtype=np.float32)
             reqs = [
                 inference_pb2.StreamPredictRequest(
@@ -63,9 +71,12 @@ def test_stream_predict_round_trip(tmp_path):
 
             responses = list(stub.StreamPredict(iter(reqs)))
             assert len(responses) == 2
+            # every tile answered exactly once
+            assert sorted(r.metadata.get("tile_id") for r in responses) == ["tile1", "tile2"]
             for resp in responses:
                 assert resp.end_of_sequence is True
-                assert resp.metadata.get("model_id") == model_id or model_id
+                assert resp.metadata.get("error") is None
+                assert resp.metadata.get("model_id") == model_id
                 out = np.frombuffer(resp.output, dtype=np.dtype(resp.dtype)).reshape(resp.shape)
                 assert out.size > 0
                 # Ensure device metadata is present

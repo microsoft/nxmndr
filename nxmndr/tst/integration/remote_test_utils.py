@@ -12,6 +12,10 @@ from nxmndr.server.server import InferenceService, GRPC_OPTIONS
 from nxmndr.inference import inference_pb2_grpc
 
 DEFAULT_CONNECT_TIMEOUT = 30
+# RemoteTestServer reuses the server named by NXMNDR_REMOTE_HOST/PORT only when this
+# is "1"; otherwise it always starts its own loopback server, so variables left in the
+# shell cannot point the tests at another server.
+REMOTE_OPT_IN_ENV = "NXMNDR_TEST_USE_REMOTE_SERVER"
 
 logger = logging.getLogger(__name__)
 
@@ -32,11 +36,20 @@ def get_remote_port() -> Optional[int]:
     return None
 
 
-def test_server(port: int = 0):
-    """Start inference server (test mode) and return (server, bound_port)."""
+def remote_server_opted_in() -> bool:
+    """True when NXMNDR_TEST_USE_REMOTE_SERVER=1 allows reusing an external server."""
+    return os.getenv(REMOTE_OPT_IN_ENV, "").strip() == "1"
+
+
+def start_test_server(port: int = 0):
+    """Start inference server (test mode) on 127.0.0.1 and return (server, bound_port).
+
+    Not named ``test_*``, so importing it into a test module or conftest never
+    makes pytest collect it as a test.
+    """
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=4), options=GRPC_OPTIONS)
     inference_pb2_grpc.add_InferenceServiceServicer_to_server(InferenceService(), server)
-    bound_port = server.add_insecure_port(f"[::]:{port}")
+    bound_port = server.add_insecure_port(f"127.0.0.1:{port}")
     server.start()
     logger.info(f"[remote_test_utils] Started test gRPC server on port {bound_port}")
     return server, bound_port
@@ -45,6 +58,8 @@ def test_server(port: int = 0):
 __all__ = [
     "get_remote_host",
     "get_remote_port",
+    "remote_server_opted_in",
+    "start_test_server",
     "RemoteTestServer",
     "server_channel",
 ]
@@ -92,7 +107,8 @@ def _resolve_endpoint(
 class RemoteTestServer:
     """Context manager for a test gRPC inference server returning only a channel.
 
-    If NXMNDR_REMOTE_{HOST,PORT} are set, reuses existing server. Otherwise starts an ephemeral server.
+    Starts an ephemeral server on 127.0.0.1. Only with NXMNDR_TEST_USE_REMOTE_SERVER=1
+    does it reuse the server named by NXMNDR_REMOTE_{HOST,PORT} instead.
     """
 
     def __init__(self, port: int = 0):
@@ -105,8 +121,11 @@ class RemoteTestServer:
         self._host: str = "localhost"
 
     def __enter__(self):
-        raw_host = get_remote_host()
-        port_env = get_remote_port()
+        if remote_server_opted_in():
+            raw_host = get_remote_host()
+            port_env = get_remote_port()
+        else:
+            raw_host, port_env = "localhost", None  # never an inherited endpoint
         host, port, scheme = _resolve_endpoint(raw_host, port_env)
         self._host = host
         self._scheme = scheme
@@ -130,10 +149,11 @@ class RemoteTestServer:
             self._port = port_env
             logger.info(f"[RemoteTestServer] Reusing localhost server at {host}:{self._port}")
         else:
-            # Start ephemeral server
-            self._server, self._port = test_server(self._requested_port)
+            # Start ephemeral server (bound to 127.0.0.1 only)
+            self._server, self._port = start_test_server(self._requested_port)
+            self._host = "127.0.0.1"
             self._ephemeral = True
-            logger.info(f"[RemoteTestServer] Started ephemeral server at {host}:{self._port}")
+            logger.info(f"[RemoteTestServer] Started ephemeral server at {self._host}:{self._port}")
 
         # Create channel (single location)
         target = self._host if self._port is None else f"{self._host}:{self._port}"

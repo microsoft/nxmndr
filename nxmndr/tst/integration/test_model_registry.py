@@ -6,7 +6,7 @@ from pathlib import Path
 
 from nxmndr.client import InferenceGrpcClient
 from tst.example_model.modeling_exampleconv import export
-from tst.integration.remote_test_utils import test_server as start_test_server
+from tst.integration.remote_test_utils import start_test_server
 
 
 @pytest.mark.integration
@@ -23,7 +23,7 @@ def test_model_registry_list_and_evict(tmp_path):
     bound_port = None
     try:
         server, bound_port = start_test_server()
-        client = InferenceGrpcClient(f"localhost:{bound_port}", timeout=10)
+        client = InferenceGrpcClient(f"127.0.0.1:{bound_port}", timeout=10)
 
         model_id = client.load_model(
             model_id="registry-test",

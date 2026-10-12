@@ -29,7 +29,9 @@ def build_parser() -> argparse.ArgumentParser:
         "server", help="Run unified HTTP server (inference + optional Azure proxy)"
     )
     sp_server.add_argument("--port", type=int, default=8080)
-    sp_server.add_argument("--host", default="0.0.0.0")
+    sp_server.add_argument(
+        "--host", default="127.0.0.1", help="bind address (default: 127.0.0.1, this machine only)"
+    )
     sp_server.add_argument(
         "--azure-proxy", action="store_true", help="Enable Azure OpenAI proxy endpoints"
     )
@@ -37,6 +39,9 @@ def build_parser() -> argparse.ArgumentParser:
     # Legacy gRPC server
     sp_grpc = sub.add_parser("grpc", help="Run legacy gRPC inference server only")
     sp_grpc.add_argument("--grpc-port", type=int, default=50051)
+    sp_grpc.add_argument(
+        "--host", default="127.0.0.1", help="bind address (default: 127.0.0.1, this machine only)"
+    )
 
     return p
 
@@ -53,7 +58,7 @@ def main(argv=None):
     elif args.command == "grpc":
         from nxmndr.server import serve
 
-        serve(port=args.grpc_port)
+        serve(port=args.grpc_port, host=args.host)
     else:
         build_parser().print_help()
         return 1

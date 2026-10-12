@@ -1,0 +1,218 @@
+{
+ "about": "StreamPredictRequest.context and StreamPredictResponse.metadata v1. Unprefixed context keys are reserved; per-tile options use the 'opt.' prefix on the first message of a tile. Session options come from OpenSessionRequest.options minus session_control_option_keys. SAM coordinates are chip pixels (x = column, y = row, origin at the chip's top-left corner).",
+ "reserved_context_keys": [
+  "session_id",
+  "tile_id",
+  "batch_size"
+ ],
+ "tile_option_prefix": "opt.",
+ "session_control_option_keys": [
+  "max_tile_bytes",
+  "batch_size"
+ ],
+ "capability": {
+  "key": "stream_context_version",
+  "value": "1"
+ },
+ "session_options": {
+  "task_type": "segmentation",
+  "return_embeddings": "false",
+  "max_tile_bytes": "67108864"
+ },
+ "tiles": [
+  {
+   "tile_id": "r0_c0",
+   "tile_options": {
+    "sam_input_points": "[[12.5,40.0],[100.0,7.25]]",
+    "sam_input_labels": "[1,0]",
+    "sam_input_bbox": "[0.0,0.0,256.0,200.0]"
+   },
+   "first_message_context": {
+    "tile_id": "r0_c0",
+    "session_id": "sess-sam-1",
+    "opt.sam_input_points": "[[12.5,40.0],[100.0,7.25]]",
+    "opt.sam_input_labels": "[1,0]",
+    "opt.sam_input_bbox": "[0.0,0.0,256.0,200.0]"
+   },
+   "later_message_context": {
+    "tile_id": "r0_c0",
+    "session_id": "sess-sam-1"
+   },
+   "effective_options": {
+    "task_type": "segmentation",
+    "return_embeddings": "false",
+    "sam_input_points": "[[12.5,40.0],[100.0,7.25]]",
+    "sam_input_labels": "[1,0]",
+    "sam_input_bbox": "[0.0,0.0,256.0,200.0]"
+   }
+  },
+  {
+   "tile_id": "r0_c1",
+   "tile_options": {
+    "sam_text_prompt": "field"
+   },
+   "first_message_context": {
+    "tile_id": "r0_c1",
+    "session_id": "sess-sam-1",
+    "opt.sam_text_prompt": "field"
+   },
+   "later_message_context": {
+    "tile_id": "r0_c1",
+    "session_id": "sess-sam-1"
+   },
+   "effective_options": {
+    "task_type": "segmentation",
+    "return_embeddings": "false",
+    "sam_text_prompt": "field"
+   }
+  }
+ ],
+ "sam_options_valid": [
+  {
+   "options": {
+    "sam_input_points": "[[1.0,2.0]]",
+    "sam_input_labels": "[1]"
+   }
+  },
+  {
+   "options": {
+    "sam_input_bbox": "[10.0,20.0,30.5,40.5]"
+   }
+  },
+  {
+   "options": {
+    "sam_text_prompt": "road",
+    "sam_input_points": "[[1.0,2.0],[3.0,4.0]]",
+    "sam_input_labels": "[0,1]",
+    "sam_conf_threshold": "0.3",
+    "sam_mask_threshold": "0.5"
+   }
+  }
+ ],
+ "sam_options_invalid": [
+  {
+   "reason": "points without labels",
+   "options": {
+    "sam_input_points": "[[1,2]]"
+   }
+  },
+  {
+   "reason": "count mismatch",
+   "options": {
+    "sam_input_points": "[[1,2],[3,4]]",
+    "sam_input_labels": "[1]"
+   }
+  },
+  {
+   "reason": "label must be 0 or 1",
+   "options": {
+    "sam_input_points": "[[1,2]]",
+    "sam_input_labels": "[2]"
+   }
+  },
+  {
+   "reason": "legacy 4-level nesting is not the v1 wire format",
+   "options": {
+    "sam_input_points": "[[[[1,2]]]]",
+    "sam_input_labels": "[1]"
+   }
+  },
+  {
+   "reason": "malformed JSON",
+   "options": {
+    "sam_input_bbox": "[1,2,3"
+   }
+  },
+  {
+   "reason": "inverted box",
+   "options": {
+    "sam_input_bbox": "[30,40,10,20]"
+   }
+  },
+  {
+   "reason": "threshold outside [0, 1]",
+   "options": {
+    "sam_conf_threshold": "1.5"
+   }
+  }
+ ],
+ "context_invalid": [
+  {
+   "reason": "option key with an illegal name after the prefix",
+   "context": {
+    "tile_id": "r0_c0",
+    "opt.Bad-Key": "1"
+   }
+  },
+  {
+   "reason": "prefixed reserved key",
+   "context": {
+    "tile_id": "r0_c0",
+    "opt.tile_id": "r9_c9"
+   }
+  }
+ ],
+ "response_metadata_examples": [
+  {
+   "about": "ok tile, raw array payload",
+   "metadata": {
+    "session_id": "sess-sam-1",
+    "tile_id": "r0_c0",
+    "result_type": "segmentation_mask",
+    "payload_format": "raw"
+   }
+  },
+  {
+   "about": "ok tile, NPZ tensor bundle payload",
+   "metadata": {
+    "session_id": "sess-sam-1",
+    "tile_id": "r0_c1",
+    "result_type": "segmentation_mask",
+    "payload_format": "npz",
+    "bundle_keys": "confidence,mask"
+   }
+  },
+  {
+   "about": "one tile failed, stream continues",
+   "metadata": {
+    "session_id": "sess-sam-1",
+    "tile_id": "r0_c2",
+    "error": "sam prompt: points and labels must have the same length",
+    "error_code": "malformed_options",
+    "error_scope": "tile"
+   }
+  },
+  {
+   "about": "stream terminating; host marks every unresolved tile error",
+   "metadata": {
+    "session_id": "sess-sam-1",
+    "error": "backpressure: too many buffered chunks",
+    "error_code": "backpressure",
+    "error_scope": "stream"
+   }
+  }
+ ],
+ "error_codes": [
+  "missing_tile_id",
+  "duplicate_tile_id",
+  "unknown_session",
+  "session_not_open",
+  "malformed_payload",
+  "malformed_options",
+  "chunk_too_large",
+  "tile_too_large",
+  "backpressure",
+  "resource_exhausted",
+  "inference_failed",
+  "cancelled",
+  "internal"
+ ],
+ "error_scopes": [
+  "tile",
+  "stream"
+ ],
+ "payload_formats": [
+  "raw",
+  "npz"
+ ]
+}
