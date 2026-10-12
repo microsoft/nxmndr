@@ -28,10 +28,10 @@ classifiers = [
 # Core (lean) dependencies – minimal to import & use core inference classes
 dependencies = [
   "numpy==2.4.3",
-  "torch==2.11.0",
+  "torch==2.13.0",
   # torchvision models are the required family of the PyTorch model catalog
   # (nxmndr.models.catalog).
-  "torchvision==0.26.0",
+  "torchvision==0.28.0",
   "onnxruntime==1.24.4",
   "transformers==5.10.1",
   "grpcio==1.78.0",
