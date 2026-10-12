@@ -2,7 +2,7 @@
 # Source of truth for dependency specification is pyproject.toml.
 
 numpy==2.4.3
-torch==2.11.0
+torch==2.13.0
 torchvision==0.26.0
 onnxruntime==1.24.4
 transformers==5.10.1
