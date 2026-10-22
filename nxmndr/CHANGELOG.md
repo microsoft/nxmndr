@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 (2026-10-20)
 
-Changes relative to the previous version, microsoft/nxmndr `main` at commit `f0463ee` (later commits there change only dependency versions and the README's demo image). Every "was" describes that version.
+Changes relative to the previous version, 0.1.0: microsoft/nxmndr `main` at commit `f0463ee` (later commits there change only dependency versions and the README's demo image). Every "was" describes that version.
 
 ### Breaking changes
 
