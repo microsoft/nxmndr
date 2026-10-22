@@ -2,7 +2,7 @@
 
 ## 0.2.0 (2026-10-20)
 
-Changes relative to the previous version, 0.1.0: microsoft/nxmndr `main` at commit `f0463ee` (later commits there change only dependency versions and the README's demo image). Every "was" describes that version.
+Changes relative to the previous version, 0.1.0: microsoft/nxmndr `main` at commit `3bcd13d`. `main` from `9562786` (the merge of #5) to `e160567` already had these changes but still reported 0.1.0. Every "was" describes `3bcd13d`.
 
 ### Breaking changes
 
