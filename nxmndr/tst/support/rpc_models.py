@@ -90,13 +90,13 @@ def register() -> None:
     register_pytorch_model(HUNG_ADD_CONST_CLASS, HungAddConst)
 
 
-def crashing_worker(master_addr, master_port, ready_port, startup_timeout_s, device="cpu"):
+def crashing_worker(conn, model_classes, device="cpu"):
     """Exits with code 3 before it reports ready (a broken worker environment)."""
 
     os._exit(3)
 
 
-def silent_worker(master_addr, master_port, ready_port, startup_timeout_s, device="cpu"):
+def silent_worker(conn, model_classes, device="cpu"):
     """Never reports ready (a hung import); exits only when its parent is gone."""
 
     parent = os.getppid()

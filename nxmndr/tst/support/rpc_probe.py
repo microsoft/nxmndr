@@ -11,14 +11,15 @@ importable module because a ``spawn`` child unpickles its target by reference.
 
 from __future__ import annotations
 
+import multiprocessing
 import os
 from pathlib import Path
 
 MARKER_ENV = "NXMNDR_TEST_RPC_MARKER"
 
 
-def marker_worker(master_addr, master_port, ready_port, startup_timeout_s, device="cpu"):
+def marker_worker(conn, model_classes, device="cpu"):
     Path(os.environ[MARKER_ENV]).write_text(
-        f"pid={os.getpid()} ready_port={ready_port}", encoding="utf-8"
+        f"pid={os.getpid()} method={multiprocessing.get_start_method()}", encoding="utf-8"
     )
     raise SystemExit(0)

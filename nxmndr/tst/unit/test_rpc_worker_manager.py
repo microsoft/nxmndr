@@ -1,12 +1,11 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 
-"""RpcWorkerManager and the PyTorch record, without a real RPC group.
+"""RpcWorkerManager and the PyTorch record, without a real worker process.
 
-- Every ``rpc_sync`` call passes the worker function object, never its name
-  (PyTorch rejects a string with "function should be callable").
+- Calls send operation names and model identifiers, never Python callables.
 - A failed ``_rpc_stop`` is logged, then the child is terminated.
-- A stop does not wait for a call in flight: both ranks leave the RPC group at once.
+- A stop does not wait for a call in flight: the private channel is closed.
 - A generic PyTorch record owns its worker-side model as an aux resource: disposing
   the record frees that model exactly once.
 - A catalog model the worker cannot build is returned as a refusal, raised in the
@@ -19,10 +18,7 @@
   the model when its build ends; the fingerprint is taken before the model moves.
 - A model's device is that of its parameters, else of its buffers; the input moves there
   and every output tensor, also inside a dict, list or tuple, comes back on the CPU.
-- After a stopped server, a later one in the process is refused with the reason.
-- The RPC group listens on loopback unless MASTER_ADDR names another address.
-- An external worker's report connection stays open: when it closes, the worker counts
-  as gone and the next load names it.
+- External workers fail closed without starting a transport.
 - Uploaded PyTorch weights are refused when an external worker may be on another host.
 The real worker, rendezvous and routing run in tst/integration/test_rpc_pytorch_service.py.
 """
@@ -62,25 +58,28 @@ class _Proc:
 
 
 def _running_manager(monkeypatch):
+    from types import SimpleNamespace
+
     manager = managers.RpcWorkerManager()
     manager._state = "running"
     manager._proc = _Proc()
     left = []
-    monkeypatch.setattr(managers.RpcWorkerManager, "_leave_group", staticmethod(lambda graceful: left.append(graceful)))
+    manager._model_classes = {"AddConst": AddConst}
+    manager._client = SimpleNamespace(close=lambda: left.append(True))
     return manager, left
 
 
-def test_rpc_calls_pass_the_worker_functions_not_their_names(monkeypatch, tmp_path):
+def test_worker_calls_send_names_and_not_python_callables(monkeypatch, tmp_path):
     calls = []
 
-    def fake_rpc_sync(to, func, args=(), kwargs=None, timeout=None):
-        calls.append((to, func, args))
-        if func is rpc_worker._rpc_load:
+    def fake_call(operation, args=(), timeout=None):
+        calls.append((operation, args))
+        if operation == "_rpc_load":
             return {"model_id": args[0], "device": "cpu", "fingerprint": "sha256:x"}
         return True
 
-    monkeypatch.setattr(managers.torch_rpc, "rpc_sync", fake_rpc_sync)
     manager, left = _running_manager(monkeypatch)
+    manager._client.call = fake_call
     spec = PytorchModelSpec(model_class=AddConst, model_path=str(tmp_path / "w.pt"), name="w")
 
     assert manager.load("m1", spec)["model_id"] == "m1"
@@ -89,57 +88,60 @@ def test_rpc_calls_pass_the_worker_functions_not_their_names(monkeypatch, tmp_pa
     manager.status()
     manager.stop()
 
-    funcs = [func for _, func, _ in calls]
+    funcs = [func for func, _ in calls]
     assert funcs == [
-        rpc_worker._rpc_load,
-        rpc_worker._rpc_infer,
-        rpc_worker._rpc_unload,
-        rpc_worker._rpc_status,
-        rpc_worker._rpc_stop,
+        "_rpc_load",
+        "_rpc_infer",
+        "_rpc_unload",
+        "_rpc_status",
+        "_rpc_stop",
     ]
-    assert all(callable(f) and not isinstance(f, str) for f in funcs)
-    assert all(to == managers.RPC_WORKER_NAME for to, _, _ in calls)
-    assert calls[0][2] == ("m1", {"model_class": AddConst, "model_path": str(tmp_path / "w.pt"), "name": "w"})
-    assert calls[1][2] == ("m1", "tensor", "cpu")
-    assert calls[4][2] == (True,)
-    assert left == [True]  # a live worker with no call in flight gets a graceful RPC shutdown
+    assert calls[0][1] == (
+        "m1",
+        {"model_class": "AddConst", "model_path": str(tmp_path / "w.pt"), "name": "w"},
+    )
+    assert calls[1][1] == ("m1", "tensor", "cpu")
+    assert calls[4][1] == (True,)
+    assert left == [True]
 
 
 def test_a_failed_rpc_stop_is_logged_then_the_worker_is_terminated(monkeypatch, caplog):
-    def failing_rpc_sync(to, func, args=(), kwargs=None, timeout=None):
-        assert func is rpc_worker._rpc_stop
+    def failing_call(operation, args=(), timeout=None):
+        assert operation == "_rpc_stop"
         raise RuntimeError("worker unreachable")
 
-    monkeypatch.setattr(managers.torch_rpc, "rpc_sync", failing_rpc_sync)
     manager, left = _running_manager(monkeypatch)
+    manager._client.call = failing_call
     proc = manager._proc
     with caplog.at_level(logging.WARNING):
         manager.stop()
     assert any(
-        "_rpc_stop failed" in r.getMessage() and r.exc_info and "worker unreachable" in str(r.exc_info[1])
+        "_rpc_stop failed" in r.getMessage()
+        and r.exc_info
+        and "worker unreachable" in str(r.exc_info[1])
         for r in caplog.records
     ), [r.getMessage() for r in caplog.records]
     assert "terminate" in proc.calls
-    assert left == [False]  # no graceful shutdown with an unreachable peer
+    assert left == [True]
     assert manager._state == "stopped" and not manager.is_alive()
 
 
-def test_a_stop_with_a_call_in_flight_leaves_the_rpc_group_without_waiting(monkeypatch):
+def test_a_stop_with_a_call_in_flight_closes_the_channel_without_waiting(monkeypatch):
     import threading
 
     calls = []
     started, release = threading.Event(), threading.Event()
 
-    def fake_rpc_sync(to, func, args=(), kwargs=None, timeout=None):
+    def fake_call(func, args=(), timeout=None):
         calls.append((func, args))
-        if func is rpc_worker._rpc_load:  # a load still building in the worker
+        if func == "_rpc_load":
             started.set()
             release.wait(timeout=30)
             raise RuntimeError("pipe closed")  # what the in-flight call gets on the leave
-        return {"status": "stopping"} if func is rpc_worker._rpc_stop else False
+        return {"status": "stopping"} if func == "_rpc_stop" else False
 
-    monkeypatch.setattr(managers.torch_rpc, "rpc_sync", fake_rpc_sync)
     manager, left = _running_manager(monkeypatch)
+    manager._client.call = fake_call
     spec = PytorchModelSpec(model_class=AddConst, model_path="w.pt", name="w")
     failed = []
 
@@ -157,9 +159,8 @@ def test_a_stop_with_a_call_in_flight_leaves_the_rpc_group_without_waiting(monke
     finally:
         release.set()
         loader.join(timeout=30)
-    # The worker is told to leave at once too, and the graceful barrier is skipped.
-    assert (rpc_worker._rpc_stop, (False,)) in calls
-    assert left == [False]
+    assert ("_rpc_stop", (False,)) in calls
+    assert left == [True]
     assert failed == ["pipe closed"]
     with pytest.raises(managers.RpcWorkerStartError, match="not running"):
         manager.status()  # no call starts after the stop
@@ -265,12 +266,12 @@ def test_the_worker_refuses_a_catalog_model_it_cannot_build(tmp_path):
 def test_a_refusal_is_raised_in_the_server_as_the_catalog_error(monkeypatch, caplog, tmp_path):
     replies = []
 
-    def fake_rpc_sync(to, func, args=(), kwargs=None, timeout=None):
-        assert func is rpc_worker._rpc_load
+    def fake_call(operation, args=(), timeout=None):
+        assert operation == "_rpc_load"
         return {"model_id": args[0], "refused": replies.pop(0)}
 
-    monkeypatch.setattr(managers.torch_rpc, "rpc_sync", fake_rpc_sync)
     manager, _ = _running_manager(monkeypatch)
+    manager._client.call = fake_call
     spec = PytorchModelSpec(
         model_class="torchvision:resnet18", model_path=str(tmp_path / "w.pt"), name="w"
     )
@@ -311,59 +312,40 @@ def test_a_catalog_refusal_is_a_request_error_on_the_wire():
     assert InferenceService._cache_error_details(other) == str(other)
 
 
-def _listener():
-    import socket
-
-    listener = socket.create_server(("127.0.0.1", 0))
-    listener.settimeout(0.1)
-    return listener, listener.getsockname()[1]
-
-
-def test_the_ready_handshake_accepts_only_its_child_and_keeps_its_deadline():
-    import socket
-    import threading
+def test_the_private_ready_handshake_keeps_its_deadline():
+    import multiprocessing
     import time
 
-    listener, port = _listener()
+    from nxmndr.server.worker_ipc import send_message
+
+    parent, child = multiprocessing.Pipe()
     proc = _Proc()
-    stop = threading.Event()
-
-    def stray():  # a local process that keeps connecting with the wrong line
-        while not stop.is_set():
-            try:
-                with socket.create_connection(("127.0.0.1", port), timeout=1) as conn:
-                    conn.sendall(b"ready 1\n")
-            except OSError:
-                pass
-            time.sleep(0.01)
-
-    thread = threading.Thread(target=stray, daemon=True)
-    thread.start()
     try:
         started = time.monotonic()
         with pytest.raises(managers.RpcWorkerStartError, match="within 0.5 s"):
-            managers.RpcWorkerManager._await_ready(proc, listener, 0.5)
+            managers.RpcWorkerManager._await_ready(proc, parent, 0.5)
         assert time.monotonic() - started < 2.0
+        send_message(child, {"ready": proc.pid})
+        managers.RpcWorkerManager._await_ready(proc, parent, 5.0)
+        send_message(child, {"ready": 1})
+        with pytest.raises(managers.RpcWorkerStartError, match="invalid"):
+            managers.RpcWorkerManager._await_ready(proc, parent, 5.0)
+        proc.alive = False
+        with pytest.raises(managers.RpcWorkerStartError, match="exited with code None"):
+            managers.RpcWorkerManager._await_ready(proc, parent, 5.0)
     finally:
-        stop.set()
-        thread.join(timeout=5)
-
-    with socket.create_connection(("127.0.0.1", port), timeout=1) as conn:
-        conn.sendall(f"ready {proc.pid}\n".encode("ascii"))
-        managers.RpcWorkerManager._await_ready(proc, listener, 5.0)  # returns: its own child
-    proc.alive = False
-    with pytest.raises(managers.RpcWorkerStartError, match="exited with code None"):
-        managers.RpcWorkerManager._await_ready(proc, listener, 5.0)
-    listener.close()
+        parent.close()
+        child.close()
 
 
 def test_the_spawned_worker_applies_the_cudnn_policy_then_runs_on_its_device(monkeypatch):
     calls = []
     monkeypatch.setattr(rpc_worker, "configure_cudnn", lambda: calls.append(("cudnn",)))
-    monkeypatch.setattr(rpc_worker, "run_worker", lambda *a, **kw: calls.append(("run", a, kw)))
-    managers._run_rpc_worker("127.0.0.1", 1, 2, 3.0, "cuda:0")
+    monkeypatch.setattr(rpc_worker, "run_ipc_worker", lambda *a, **kw: calls.append(("run", a, kw)))
+    managers._run_rpc_worker("pipe", {"AddConst": AddConst}, "cuda:0")
     assert [c[0] for c in calls] == ["cudnn", "run"]
-    assert calls[1][2]["device"] == "cuda:0" and calls[1][2]["ready_port"] == 2
+    assert calls[1][2]["device"] == "cuda:0"
+    assert calls[1][1] == ("pipe", {"AddConst": AddConst})
 
 
 def test_the_server_gives_its_rpc_worker_the_first_gpu_of_its_device_plan(monkeypatch, tmp_path):
@@ -385,21 +367,21 @@ def test_the_server_gives_its_rpc_worker_the_first_gpu_of_its_device_plan(monkey
 def test_a_load_that_fails_in_the_server_is_abandoned_in_the_worker(monkeypatch, tmp_path):
     calls = []
 
-    def fake_rpc_sync(to, func, args=(), kwargs=None, timeout=None):
+    def fake_call(func, args=(), timeout=None):
         calls.append((func, args, timeout))
-        if func is rpc_worker._rpc_load:
+        if func == "_rpc_load":
             raise RuntimeError("RPC ran for more than set timeout (300000 ms)")
         return False
 
-    monkeypatch.setattr(managers.torch_rpc, "rpc_sync", fake_rpc_sync)
     manager, _ = _running_manager(monkeypatch)
+    manager._client.call = fake_call
     spec = PytorchModelSpec(model_class=AddConst, model_path=str(tmp_path / "w.pt"), name="w")
     with pytest.raises(RuntimeError, match="set timeout"):
         manager.load("m1", spec)
     assert [(func, args[0], timeout) for func, args, timeout in calls[:1]] == [
-        (rpc_worker._rpc_load, "m1", managers.RPC_LOAD_TIMEOUT_SECONDS)
+        ("_rpc_load", "m1", managers.RPC_LOAD_TIMEOUT_SECONDS)
     ]
-    assert [(func, args) for func, args, _ in calls[1:]] == [(rpc_worker._rpc_unload, ("m1", True))]
+    assert [(func, args) for func, args, _ in calls[1:]] == [("_rpc_unload", ("m1", True))]
 
 
 def test_a_load_abandoned_while_it_builds_drops_its_model(tmp_path):
@@ -414,7 +396,9 @@ def test_a_load_abandoned_while_it_builds_drops_its_model(tmp_path):
     rpc_models.GATED_STARTED.clear()
     rpc_models.GATED_RELEASE.clear()
     replies = []
-    thread = threading.Thread(target=lambda: replies.append(rpc_worker._rpc_load("unit-gated", payload)))
+    thread = threading.Thread(
+        target=lambda: replies.append(rpc_worker._rpc_load("unit-gated", payload))
+    )
     thread.start()
     try:
         assert rpc_models.GATED_STARTED.wait(timeout=30)
@@ -524,7 +508,10 @@ def test_on_a_gpu_the_worker_moves_the_input_and_every_output_tensor(tmp_path):
     device = _accelerator()
     path = rpc_models.save_add_const(tmp_path / "w.pt", 1.0)
     try:
-        for model_id, model_class in (("unit-gpu-buf", BufferAddConst), ("unit-gpu-nest", NestedAddConst)):
+        for model_id, model_class in (
+            ("unit-gpu-buf", BufferAddConst),
+            ("unit-gpu-nest", NestedAddConst),
+        ):
             payload = {"model_class": model_class, "model_path": path, "name": "w"}
             info = rpc_worker._rpc_load(model_id, payload, device)
             assert info["device"].split(":")[0] == device.split(":")[0], info
@@ -661,9 +648,7 @@ def test_a_registered_class_loads_its_own_state_dict_with_values_that_are_not_te
             saved.bias.fill_(2.0)
     else:
         weight = torch.arange(12, dtype=torch.float32).reshape(3, 4) / 10
-        saved.set_weight_bias(
-            torch.quantize_per_tensor(weight, 0.1, 0, torch.qint8), torch.ones(3)
-        )
+        saved.set_weight_bias(torch.quantize_per_tensor(weight, 0.1, 0, torch.qint8), torch.ones(3))
     path = tmp_path / "w.pt"
     torch.save(saved.state_dict(), str(path))
     assert any(not torch.is_tensor(value) for value in saved.state_dict().values())
@@ -678,14 +663,22 @@ def test_a_registered_class_loads_its_own_state_dict_with_values_that_are_not_te
         rpc_worker._rpc_unload("unit-own-state")
 
 
-@pytest.mark.parametrize("state", ["stopped", "broken"])
-def test_a_server_after_a_stopped_one_in_the_process_is_refused_with_the_reason(monkeypatch, state):
-    earlier = managers.RpcWorkerManager()
-    earlier._state = state
-    monkeypatch.setattr(managers, "_process_owner", earlier)
-    monkeypatch.setattr(managers.dist, "is_initialized", lambda: pytest.fail("torch reached"))
-    with pytest.raises(managers.RpcWorkerStartError, match="new process"):
-        managers.RpcWorkerManager().ensure_started()
+def test_external_mode_is_refused_before_any_process_or_listener_starts(monkeypatch):
+    monkeypatch.setattr(
+        managers.multiprocessing, "get_context", lambda *args: pytest.fail("process started")
+    )
+    manager = managers.RpcWorkerManager(external_worker=True, master_addr="0.0.0.0")
+    with pytest.raises(managers.RpcWorkerNotJoinedError, match="RemoteInferenceProvider"):
+        manager.ensure_started()
+    assert manager._state == "idle"
+
+
+def test_legacy_network_worker_entry_points_fail_closed():
+    with pytest.raises(RuntimeError, match="external PyTorch RPC workers are disabled"):
+        rpc_worker.run_worker("worker", master_addr="0.0.0.0")
+    with pytest.raises(SystemExit) as exc:
+        rpc_worker.main(["--master", "127.0.0.1"])
+    assert exc.value.code == 2
 
 
 def test_the_service_shutdown_stops_the_rpc_worker_after_the_cache(tmp_path, monkeypatch):
@@ -701,7 +694,7 @@ def test_the_service_shutdown_stops_the_rpc_worker_after_the_cache(tmp_path, mon
     assert calls == ["cache", "rpc"]
 
 
-def test_the_rpc_group_listens_on_loopback_unless_an_address_is_given(monkeypatch):
+def test_legacy_address_configuration_is_retained_for_external_mode_errors(monkeypatch):
     monkeypatch.delenv("MASTER_ADDR", raising=False)
     assert managers.RpcWorkerManager(external_worker=True)._addr == "127.0.0.1"
     assert managers.RpcWorkerManager(external_worker=False)._addr == "127.0.0.1"
@@ -710,56 +703,6 @@ def test_the_rpc_group_listens_on_loopback_unless_an_address_is_given(monkeypatc
     assert managers.RpcWorkerManager(external_worker=False)._addr == "127.0.0.1"
     monkeypatch.setenv("MASTER_ADDR", "192.0.2.10")
     assert managers.RpcWorkerManager(external_worker=True)._addr == "192.0.2.10"
-
-
-def test_the_external_handshake_connection_tracks_the_worker_process():
-    import os
-    import socket
-    import threading
-    import time
-
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        ready_port = probe.getsockname()[1]
-    joined = {}
-
-    def wait_for_worker():
-        joined["worker"] = managers._await_external("127.0.0.1", ready_port - 1, 10.0)
-
-    waiter = threading.Thread(target=wait_for_worker)
-    waiter.start()
-    conn = rpc_worker._join_server("127.0.0.1", ready_port, 1.0)  # retries until the server listens
-    waiter.join(timeout=10)
-    worker = joined["worker"]
-    try:
-        assert worker.pid == os.getpid() and worker.host == "127.0.0.1"
-        assert worker.is_alive()
-        conn.close()  # what the OS does when the worker process exits
-        deadline = time.monotonic() + 5
-        while worker.is_alive() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert not worker.is_alive()
-    finally:
-        worker.close()
-
-
-def test_a_disconnected_external_worker_fails_the_next_load_with_its_reason():
-    import socket
-
-    ours, theirs = socket.socketpair()
-    manager = managers.RpcWorkerManager(external_worker=True)
-    manager._state = "running"
-    manager._proc = managers._ExternalWorker(77, "192.0.2.9", ours)
-    try:
-        assert manager.is_alive()
-        theirs.close()
-        assert not manager.is_alive()
-        with pytest.raises(
-            managers.RpcWorkerStartError, match=r"\(pid 77 on 192\.0\.2\.9\) disconnected"
-        ):
-            manager.ensure_started()
-    finally:
-        ours.close()
 
 
 def test_an_external_worker_may_be_remote_only_on_a_non_loopback_address(monkeypatch):
