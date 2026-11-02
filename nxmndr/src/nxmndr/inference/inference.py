@@ -1,7 +1,6 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 
-import os
 import tempfile
 import time
 from abc import ABC, abstractmethod
@@ -9,8 +8,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.distributed as dist
-import torch.distributed.rpc as torch_rpc
 from transformers import AutoModel, AutoProcessor
 
 from ..config import get_config
@@ -317,10 +314,10 @@ class RemoteInferenceProvider(InferenceProvider):
 
 
 class TorchRpcInferenceProvider(InferenceProvider):
-    """Inference provider that delegates PyTorch model execution to a torch.distributed.rpc worker.
+    """Compatibility provider backed by a private, locally spawned PyTorch worker.
 
-    This provider assumes an external process has started the RPC framework or will be started
-    via helper utilities. For simplicity we allow lazy init on first predict if not already done.
+    Network Torch RPC is no longer supported. Use ``RemoteInferenceProvider`` for
+    inference on another host. Register custom classes before starting this provider.
     """
 
     def __init__(
@@ -340,50 +337,27 @@ class TorchRpcInferenceProvider(InferenceProvider):
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = device
+        from ..server.managers import EXTERNAL_RPC_ERROR, RpcWorkerManager, _is_loopback
+
+        if not _is_loopback(master_addr):
+            raise ValueError(EXTERNAL_RPC_ERROR)
+        self._manager = RpcWorkerManager(device=device)
 
     def _init_rpc(self):
         if self.initialized:
             return
-        os.environ.setdefault("MASTER_ADDR", self.master_addr)
-        os.environ.setdefault("MASTER_PORT", str(self.master_port))
-        # rank 0 acts as driver; skip if an RPC agent already exists (test harness may have initialized it)
-        if not torch_rpc._is_current_rpc_agent_set():  # type: ignore[attr-defined]
-            # Ensure process group is initialized using public API to avoid deprecated implicit construction
-            if dist.is_available() and not dist.is_initialized():
-                if not self._driver_initialized:
-                    init_method = f"tcp://{self.master_addr}:{self.master_port}"
-                    logger.debug("[RPC-DRIVER] init_process_group backend=gloo %s", init_method)
-                    dist.init_process_group(
-                        backend="gloo", rank=0, world_size=2, init_method=init_method
-                    )
-                    self._driver_initialized = True
-            # Use explicit TensorPipe backend options with init_method to avoid deprecated implicit PG usage
-            init_method = f"tcp://{self.master_addr}:{self.master_port}"
-            opts = torch_rpc.TensorPipeRpcBackendOptions(init_method=init_method)
-            logger.debug("[RPC-DRIVER] Initializing RPC driver at %s", init_method)
-            torch_rpc.init_rpc("driver", rank=0, world_size=2, rpc_backend_options=opts)
+        self._manager.ensure_started()
         self.initialized = True
 
     def load_spec(self, model_spec: ModelSpec):
         """Load model specification on the RPC worker."""
         self.model_spec = model_spec
-        if not self.initialized:
-            self._init_rpc()
+        from ..server.rpc_worker import DEFAULT_MODEL_ID
 
-        # Send model spec to worker for loading
-        model_spec_dict = {
-            "model_class": model_spec.model_class,
-            "model_path": model_spec.model_path,
-            "name": model_spec.name,
-        }
-
-        from ..server.rpc_worker import _rpc_load_model
-
-        result = torch_rpc.rpc_sync(self.worker_name, _rpc_load_model, args=(model_spec_dict,))
-        if not result.get("success", False):
-            raise RuntimeError(
-                f"Failed to load model on RPC worker: {result.get('error', 'Unknown error')}"
-            )
+        if self.initialized:
+            self._manager.unload(DEFAULT_MODEL_ID)
+        self._manager.load(DEFAULT_MODEL_ID, model_spec)
+        self.initialized = True
 
         logger.info(f"Model {model_spec.name} loaded successfully on RPC worker")
 
@@ -396,11 +370,10 @@ class TorchRpcInferenceProvider(InferenceProvider):
             tensor = tensor.float()
         if tensor.device.type != "cpu":
             tensor = tensor.cpu()
-        from ..server.rpc_worker import DEFAULT_MODEL_ID, _rpc_infer
+        from ..server.rpc_worker import DEFAULT_MODEL_ID
 
-        # The provider's single model: preloaded by run_worker or set by load_spec.
-        result = torch_rpc.rpc_sync(
-            self.worker_name, _rpc_infer, args=(DEFAULT_MODEL_ID, tensor, self.device)
+        result = self._manager.infer(
+            DEFAULT_MODEL_ID, tensor, device_hint=self.device, timeout=60.0
         )
         if torch.is_tensor(result):
             return result.detach().cpu().numpy()
@@ -415,32 +388,17 @@ class TorchRpcInferenceProvider(InferenceProvider):
         began = time.time()
         while time.time() - began < timeout:
             try:
-                from ..server.rpc_worker import _rpc_status
-
-                resp = torch_rpc.rpc_sync(self.worker_name, _rpc_status, args=(), timeout=1.0)
-                if resp.get("status") == "ok" and resp.get("model_loaded"):
+                resp = self._manager.status()
+                if resp.get("status") == "ok":
                     return resp
-            except Exception:
+            except RuntimeError:
+                logger.debug("Worker status unavailable", exc_info=True)
                 time.sleep(0.05)
         raise TimeoutError("RPC ping timed out after %.2fs" % timeout)
 
     def close(self):
-        if self.initialized:
-            try:
-                # Best-effort remote stop so worker exits loop gracefully
-                try:
-                    from ..server.rpc_worker import _rpc_stop
-
-                    torch_rpc.rpc_sync(self.worker_name, _rpc_stop, args=(), timeout=2.0)
-                except Exception:
-                    logger.debug(
-                        "_rpc_stop remote call failed or timed out; proceeding with shutdown"
-                    )
-                torch_rpc.shutdown()
-            except Exception:
-                pass
-            finally:
-                self.initialized = False
+        self._manager.stop()
+        self.initialized = False
 
     # Context manager support
     def __enter__(self):
@@ -502,7 +460,13 @@ def load_torchhub(spec: TorchHubModelSpec, provider, session):
         with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as tmp:
             tmp_path = Path(tmp.name)
         try:
-            torch.onnx.export(model, dummy_input, tmp_path, export_params=True, opset_version=DEFAULT_ONNX_OPSET_VERSION)
+            torch.onnx.export(
+                model,
+                dummy_input,
+                tmp_path,
+                export_params=True,
+                opset_version=DEFAULT_ONNX_OPSET_VERSION,
+            )
             onnx_spec = OnnxModelSpec(model_path=str(tmp_path), name=spec.name)
             session.model_spec = onnx_spec
             provider.load_spec(onnx_spec)
@@ -545,7 +509,9 @@ def load_pytorch(spec: PytorchModelSpec, provider, session):
                     except Exception as exc:
                         logger.debug("Cache lookup failed: %s", exc)
 
-                state_dict = torch.load(str(model_path), map_location=map_location, weights_only=True)
+                state_dict = torch.load(
+                    str(model_path), map_location=map_location, weights_only=True
+                )
                 model.load_state_dict(state_dict, strict=False)
 
                 if map_location.startswith("cuda") and torch.cuda.is_available():
@@ -730,8 +696,10 @@ def load_huggingface(spec: HuggingFaceModelSpec, provider, session):
             )
         # Place the model on the provider's device (from_pretrained loads on CPU); HuggingFaceModel
         # derives its own .device from the parameters, so inputs follow the move.
-        target_device = provider.device if provider.device != "auto" else (
-            "cuda" if torch.cuda.is_available() else "cpu"
+        target_device = (
+            provider.device
+            if provider.device != "auto"
+            else ("cuda" if torch.cuda.is_available() else "cpu")
         )
         if callable(getattr(model, "to", None)):
             model.to(target_device)

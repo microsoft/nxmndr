@@ -3,11 +3,11 @@
 
 """Generic PyTorch models through the real gRPC service and the real PyTorch RPC worker.
 
-Each test starts a fresh server process (``tst.support.rpc_service_process``;
-torch joins one RPC group per process) and talks to it only over gRPC with the
+Each test starts a fresh server process (``tst.support.rpc_service_process``)
+and talks to it only over gRPC with the
 canonical client. Nothing is mocked: the server's ``RpcWorkerManager`` starts a
-spawned worker, joins its RPC group and calls ``_rpc_load``/``_rpc_infer``/
-``_rpc_unload`` with the function objects. The model is ``AddConst`` (input plus
+spawned worker and calls ``_rpc_load``/``_rpc_infer``/``_rpc_unload`` over a private
+data-only pipe. The model is ``AddConst`` (input plus
 the scalar in its weights file), so each model's output names the model.
 
 Covers worker startup (the first OpenSession starts the worker; startup failures
@@ -16,11 +16,8 @@ RPC invocation, and two models loaded at once (they route by identity under
 concurrent pinned sessions; eviction and unload free the model in the worker; a
 reload gets a new identity). A stop does not wait for a load still building in the worker.
 
-The external-worker tests start the server with ``NXMNDR_RPC_EXTERNAL_WORKER=1`` and
-the worker as a separate ``python -m nxmndr.server.rpc_worker`` process. Two put both
-on this host's non-loopback address, as a worker on a second machine would be; one
-keeps the loopback default and kills the worker, whose models then become unavailable.
-The rendezvous store of the default server listens on loopback only, not on that address.
+Legacy external-worker configurations fail closed. Local workers open no rendezvous
+or RPC listeners, even when MASTER_ADDR requests all interfaces.
 """
 
 from __future__ import annotations
@@ -29,6 +26,7 @@ import json
 import os
 import queue
 import random
+import signal
 import socket
 import subprocess
 import sys
@@ -45,10 +43,7 @@ from nxmndr.client import InferenceGrpcClient, InferenceGrpcError
 from nxmndr.inference import inference_pb2
 from tst.support import rpc_models
 
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(not torch.distributed.is_available(), reason="torch.distributed not available"),
-]
+pytestmark = pytest.mark.integration
 
 ROOT = Path(__file__).resolve().parents[2]  # the nxmndr directory
 CHIP = np.arange(4 * 4 * 3, dtype=np.float32).reshape(4, 4, 3)
@@ -215,9 +210,9 @@ def test_first_generic_pytorch_open_session_starts_the_worker_and_serves_both_rp
         np.testing.assert_array_equal(unary, CHIP + 1)
         # The metadata names the device that ran the model: the worker's.
         assert result.metadata["device_id"] == models[model_id]["device"], result.metadata
-        assert result.metadata["device_type"] == (
-            "gpu" if torch.cuda.is_available() else "cpu"
-        ), result.metadata
+        assert result.metadata["device_type"] == ("gpu" if torch.cuda.is_available() else "cpu"), (
+            result.metadata
+        )
         # Predict records the record's metadata: it names the worker's model.
         [entry] = [e for e in client.list_model_registry() if e.model_id == model_id]
         assert entry.metadata["rpc_fingerprint"] == models[model_id]["fingerprint"]
@@ -240,7 +235,9 @@ def test_a_tile_that_runs_longer_than_five_seconds_is_served(tmp_path, service_p
     assert stopped["children"] == [], stopped
 
 
-def test_two_models_route_by_identity_across_sessions_eviction_and_reload(tmp_path, service_process):
+def test_two_models_route_by_identity_across_sessions_eviction_and_reload(
+    tmp_path, service_process
+):
     path_a = rpc_models.save_add_const(tmp_path / "a.pt", 1.0)
     path_b = rpc_models.save_add_const(tmp_path / "b.pt", 2.0)
     path_c = rpc_models.save_add_const(tmp_path / "c.pt", 3.0)
@@ -341,7 +338,7 @@ def test_worker_start_failures_are_bounded_clean_up_and_allow_a_retry(tmp_path, 
             client.load_model_result("", _spec(weights))
         waited = time.monotonic() - started
         assert 3.0 <= waited < 3.0 + 3 * 2.0 + 10.0, waited  # timeout, then bounded terminate
-        assert "not ready to join its RPC group within 3 s" in str(silent.value), str(silent.value)
+        assert "not ready within 3 s" in str(silent.value), str(silent.value)
         status = proc.command("status")
         assert status["state"] == "idle" and status["children"] == [], status
 
@@ -415,18 +412,17 @@ def test_stop_does_not_wait_for_a_load_still_building_in_the_worker(tmp_path, se
     assert len(failed) == 1, failed  # the server ended the load's call
 
 
-def test_the_rendezvous_store_listens_on_the_rpc_address_only(tmp_path, service_process):
+def test_no_worker_listener_on_loopback_or_lan(tmp_path, service_process):
     lan = _lan_address()
     port = _free_port_pair("0.0.0.0")  # free on every interface; P + 1 goes unused here
     weights = rpc_models.save_add_const(tmp_path / "a.pt", 1.0)
-    proc = service_process(env={"MASTER_PORT": str(port)})  # spawned worker, loopback default
+    proc = service_process(env={"MASTER_ADDR": "0.0.0.0", "MASTER_PORT": str(port)})
     with proc.client() as client:
         client.load_model_result("", _spec(weights))
-    # torch's own store would listen on every interface, whatever MASTER_ADDR names.
-    with socket.create_connection(("127.0.0.1", port), timeout=5):
-        pass
-    with pytest.raises(ConnectionRefusedError):
-        socket.create_connection((lan, port), timeout=5).close()
+    for addr in ("127.0.0.1", lan):
+        for target in (port, port + 1):
+            with pytest.raises((ConnectionRefusedError, TimeoutError)):
+                socket.create_connection((addr, target), timeout=5).close()
     proc.stop()
 
 
@@ -466,117 +462,35 @@ def _free_port_pair(addr: str) -> int:
     pytest.skip("no free port pair")
 
 
-@pytest.fixture
-def external_worker(tmp_path):
-    """Start ``python -m nxmndr.server.rpc_worker`` as its own process (not a child of the server).
-
-    Its working directory is ``tmp_path``, the server's is ``ROOT``: a relative weights
-    path names a file that only the worker can open.
-    """
-
-    made = []
-
-    def start(addr: str, port: int, device: str = "cpu"):
-        log = open(tmp_path / f"external_worker_{len(made)}.log", "w", encoding="utf-8")
-        proc = subprocess.Popen(
-            [sys.executable, "-m", "nxmndr.server.rpc_worker", "--master", addr,
-             "--port", str(port), "--device", device],
-            cwd=str(tmp_path), stdout=log, stderr=subprocess.STDOUT, env=_child_env(),
-        )
-        made.append((proc, log))
-        return proc
-
-    yield start
-    for proc, log in made:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait(timeout=30)
-        log.close()
-
-
-def _external_env(addr: str, port: int) -> dict:
-    return {"NXMNDR_RPC_EXTERNAL_WORKER": "1", "MASTER_ADDR": addr, "MASTER_PORT": str(port)}
-
-
-def _direct(weights, chip) -> np.ndarray:
-    model = rpc_models.AddConst()
-    model.load_state_dict(torch.load(weights, weights_only=True))
-    with torch.no_grad():
-        return model(torch.from_numpy(chip)).numpy()
-
-
-def test_external_worker_on_a_lan_address_serves_load_session_and_stream(
-    tmp_path, service_process, external_worker
-):
-    addr = _lan_address()
-    port = _free_port_pair(addr)
-    device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
-    weights = rpc_models.save_add_const(tmp_path / "a.pt", 1.5)
-    assert not (ROOT / "a.pt").exists()
-    proc = service_process(env=_external_env(addr, port))
-    worker = external_worker(addr, port, device)
-    with proc.client() as client:
-        # "a.pt" resolves in the worker's directory only: the worker opens the weights.
-        model_id = client.load_model_result("", _spec("a.pt")).model_id
-        status = proc.command("status")
-        assert status["children"] == [], status  # the server spawned nothing
-        assert status["worker"]["pid"] == worker.pid, status
-        assert status["worker"]["models"][model_id]["device"].split(":")[0] == device, status
-
-        _open(client, "s-ext", model_id=model_id)
-        chips = [CHIP, CHIP * 2]
-        tiles = _stream(client, "s-ext", chips, "t")
-        for chip, tile in zip(chips, tiles):
-            np.testing.assert_array_equal(tile, _direct(weights, chip))
-        assert client.close_session("s-ext").status == "closed"
-
-    stopped = proc.stop()  # _rpc_stop ends the external worker too
-    assert stopped["state"] == "stopped", stopped
-    assert worker.wait(timeout=60) == 0
-
-
-def test_external_worker_that_never_joins_fails_the_load_then_a_late_worker_serves(
-    tmp_path, service_process, external_worker
-):
-    addr = _lan_address()
-    port = _free_port_pair(addr)
+@pytest.mark.parametrize("addr", ["127.0.0.1", "0.0.0.0"])
+def test_external_mode_fails_closed_without_a_listener(tmp_path, service_process, addr):
+    port = _free_port_pair("0.0.0.0")
     weights = rpc_models.save_add_const(tmp_path / "a.pt", 1.0)
-    proc = service_process("--startup-timeout", "3", env=_external_env(addr, port))
+    proc = service_process(
+        env={"NXMNDR_RPC_EXTERNAL_WORKER": "1", "MASTER_ADDR": addr, "MASTER_PORT": str(port)}
+    )
     with proc.client() as client:
-        started = time.monotonic()
         with pytest.raises(InferenceGrpcError) as missing:
             client.load_model_result("", _spec(weights))
-        assert 3.0 <= time.monotonic() - started < 3.0 + 10.0
         assert missing.value.code == grpc.StatusCode.FAILED_PRECONDITION, str(missing.value)
-        assert f"no external PyTorch RPC worker joined at {addr}:{port} within 3 s" in str(
-            missing.value
-        ), str(missing.value)
+        assert "external PyTorch RPC workers are disabled" in str(missing.value)
         assert proc.command("status")["state"] == "idle"
-
-        # The failed wait never entered the torch rendezvous: a worker started now serves.
-        proc.command("timeout 60")
-        worker = external_worker(addr, port)
-        model_id = client.load_model_result("", _spec(weights)).model_id
-        np.testing.assert_array_equal(_predict(client, model_id), _direct(weights, CHIP))
-
+        assert proc.command("status")["children"] == []
+        for target in (port, port + 1):
+            with pytest.raises(ConnectionRefusedError):
+                socket.create_connection(("127.0.0.1", target), timeout=5).close()
     proc.stop()
-    assert worker.wait(timeout=60) == 0
 
 
-def test_an_external_worker_that_exits_makes_its_models_unavailable(
-    tmp_path, service_process, external_worker
-):
-    port = _free_port_pair("127.0.0.1")
+def test_a_worker_that_exits_makes_its_models_unavailable(tmp_path, service_process):
     weights = rpc_models.save_add_const(tmp_path / "a.pt", 1.0)
     other = rpc_models.save_add_const(tmp_path / "b.pt", 2.0)
-    # No MASTER_ADDR: the loopback default, with the worker on this host.
-    proc = service_process(env={"NXMNDR_RPC_EXTERNAL_WORKER": "1", "MASTER_PORT": str(port)})
-    worker = external_worker("127.0.0.1", port)
+    proc = service_process()
     with proc.client() as client:
         model_id = client.load_model_result("", _spec(weights)).model_id
         np.testing.assert_array_equal(_predict(client, model_id), CHIP + 1)
-        worker.kill()
-        worker.wait(timeout=30)
+        worker_pid = proc.command("status")["worker"]["pid"]
+        os.kill(worker_pid, signal.SIGTERM)
         deadline = time.monotonic() + 10
         while proc.command("status")["alive"] and time.monotonic() < deadline:
             time.sleep(0.1)
@@ -586,7 +500,5 @@ def test_an_external_worker_that_exits_makes_its_models_unavailable(
         assert gone.value.code == grpc.StatusCode.UNAVAILABLE, str(gone.value)
         with pytest.raises(InferenceGrpcError) as reload:
             client.load_model_result("", _spec(other))
-        assert f"(pid {worker.pid} on 127.0.0.1) disconnected" in str(reload.value), str(
-            reload.value
-        )
+        assert "the PyTorch RPC worker exited" in str(reload.value), str(reload.value)
     proc.stop()

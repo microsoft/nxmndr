@@ -75,8 +75,6 @@ import grpc
 import atexit
 import numpy as np
 import torch
-import torch.distributed as dist
-import torch.distributed.rpc as torch_rpc
 from aiohttp import web
 
 from ..logging import get_logger
@@ -166,29 +164,12 @@ def stream_max_chunk_bytes() -> int:
 
 
 def _shutdown_rpc_driver_if_needed():
-    """At exit: stop this process's PyTorch RPC worker, then drop any leftover RPC state.
-
-    The worker is stopped first (``_rpc_stop``, then a graceful shutdown on both ranks,
-    or a local one on each while a call is in flight). A leftover agent is shut down
-    locally, never gracefully, because a graceful shutdown waits without limit for a
-    peer that may be gone.
-    """
+    """At exit, stop this process's private PyTorch workers."""
 
     try:
         managers.shutdown_process_rpc_worker()
     except Exception:
-        pass
-    try:
-        if torch_rpc._is_current_rpc_agent_set():  # type: ignore[attr-defined]
-            torch_rpc.shutdown(graceful=False)
-    except Exception:
-        pass
-    try:
-        if dist.is_available() and dist.is_initialized():
-            dist.destroy_process_group()
-    except Exception:
-        # Swallow to avoid masking teardown
-        pass
+        logger.exception("Stopping the PyTorch workers at exit failed")
 
 
 atexit.register(_shutdown_rpc_driver_if_needed)

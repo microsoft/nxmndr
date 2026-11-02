@@ -1,12 +1,11 @@
 # Copyright (c) Microsoft Corporation. All rights reserved.
 # Licensed under the MIT License.
 
-"""The PyTorch RPC worker: a second process that holds generic PyTorch models.
+"""The private PyTorch worker: a second process that holds generic PyTorch models.
 
 The server's ``RpcWorkerManager`` (``nxmndr.server.managers``) starts one worker per
-server process (in external mode it waits for one started by hand) and calls these
-functions over ``torch.distributed.rpc``. RPC calls pass the function objects below,
-never their names (``rpc_sync`` rejects a string).
+server process and calls a fixed set of operations over an inherited anonymous
+pipe. Messages contain JSON and tensor bytes, never Python objects or imports.
 
 Models are routed by identity: the worker keeps a registry keyed by the model cache
 record's model ID. ``_rpc_load(model_id, spec)`` builds one model, ``_rpc_infer``
@@ -15,40 +14,29 @@ frees it, ``_rpc_stop`` ends the worker. One ID never names two models. A load t
 server stopped waiting for is abandoned (``_rpc_unload(model_id, True)``): torch does
 not cancel the call, so the worker drops that model when its build ends.
 
-A catalog model that cannot be built as requested (``nxmndr.models.catalog.CatalogError``:
-weights that do not match the class or its arguments, a missing family package), or a
-registered class whose weights file does not load strictly, is returned as a refusal,
-not raised: torch RPC would re-raise the error in the server with this process's
-traceback in its message. ``RpcWorkerManager.load`` raises it there again with the
-one-line message and logs the traceback at DEBUG.
+A catalog model that cannot be built as requested, or a registered class whose weights
+do not load strictly, is returned as a refusal. ``RpcWorkerManager.load`` raises it
+with the one-line message and logs the traceback at DEBUG.
 
-External mode: ``python -m nxmndr.server.rpc_worker --master <server address>`` runs
-this worker by hand, on the server's host or another one, for a server started with
-``NXMNDR_RPC_EXTERNAL_WORKER=1`` (``RpcWorkerManager``); see ``main``.
+External Torch RPC is disabled. Remote inference uses the nxmndr gRPC service.
 """
 
 import argparse
 import hashlib
 import itertools
 import os
-import socket
 import threading
 import time
 import traceback
-from datetime import timedelta
-from pathlib import Path
 from typing import Optional
 
 import torch
-import torch.distributed as dist
-import torch.distributed.rpc as rpc
 
 from ..logging import get_logger
 
 logger = get_logger(__name__)
 
-# The model that ``run_worker(model_spec=...)`` preloads and ``_rpc_load_model``
-# replaces: the single slot of ``TorchRpcInferenceProvider``. The server's model IDs
+# The single slot of ``TorchRpcInferenceProvider``. The server's model IDs
 # are 32-character hex strings, so they never collide with it.
 DEFAULT_MODEL_ID = "default"
 
@@ -66,7 +54,7 @@ class _LoadedModel:
         self.fingerprint = fingerprint
 
 
-# Use global state for RPC worker since each RPC call might be in different threads
+# Worker operations run in different threads.
 _worker_state = {
     "models": {},  # model_id -> _LoadedModel
     "loading": set(),  # model IDs whose _rpc_load is running
@@ -75,10 +63,10 @@ _worker_state = {
     "spec": None,
     "initialized": False,
     "stop_requested": False,
-    "pg_initialized": False,
     "rpc_initialized": False,
 }
 _models_lock = threading.Lock()
+_worker_model_classes: dict[str, type] = {}
 
 
 def _get_worker_state():
@@ -100,6 +88,8 @@ def _load_model(model_spec, device: str = "cpu"):
     """
 
     model_class = _spec_value(model_spec, "model_class")
+    if isinstance(model_class, str):
+        model_class = _worker_model_classes.get(model_class, model_class)
     target = "cpu"
     if device and device.startswith("cuda") and torch.cuda.is_available():
         target = device
@@ -174,7 +164,9 @@ def configure_cudnn() -> None:
     override = os.environ.get("NXMNDR_CUDNN")
     if override is not None:
         torch.backends.cudnn.enabled = override.strip() not in {"0", "false", "no", "off"}
-        logger.info("cuDNN %s by NXMNDR_CUDNN", "enabled" if torch.backends.cudnn.enabled else "disabled")
+        logger.info(
+            "cuDNN %s by NXMNDR_CUDNN", "enabled" if torch.backends.cudnn.enabled else "disabled"
+        )
         return
     try:
         if not torch.cuda.is_available():
@@ -185,7 +177,9 @@ def configure_cudnn() -> None:
             torch.backends.cudnn.enabled = False
             logger.warning(
                 "cuDNN %s does not support SM %d.%d GPUs; cuDNN disabled, using native CUDA kernels",
-                ".".join(str(v) for v in compiled), min_cc[0], min_cc[1],
+                ".".join(str(v) for v in compiled),
+                min_cc[0],
+                min_cc[1],
             )
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("cuDNN capability check skipped: %s", exc)
@@ -203,8 +197,7 @@ def _model_device(model) -> str:
 def _to_cpu(value):
     """``value`` with every tensor in it on the CPU, also inside dicts, lists and tuples.
 
-    TensorPipe sends CPU tensors only (the RPC group sets no device map), so a model
-    output left on the GPU would fail the call.
+    The private channel carries CPU tensor bytes.
     """
 
     if torch.is_tensor(value):
@@ -292,7 +285,7 @@ def _rpc_load(model_id, spec, device=None):
 
     ``device`` defaults to the worker's own (``run_worker(device=...)``, else cpu).
 
-    ``spec`` has ``model_class`` (a registered class itself, or a catalog name with its
+    ``spec`` has ``model_class`` (a locally allowlisted class name, or a catalog name with its
     ``catalog_args``), ``model_path`` and ``name``, as a mapping or as attributes. A
     model ID that is loaded or loading is refused, so one ID never names two models.
     A catalog model's result also has ``catalog`` (``CatalogModel.catalog_info``).
@@ -335,7 +328,10 @@ def _rpc_load(model_id, spec, device=None):
         return {"model_id": model_id, "abandoned": True}
     logger.info(
         "Loaded model %s (%s) on %s, %s",
-        model_id, _spec_value(spec, "name") or "unnamed", info["device"], info["fingerprint"],
+        model_id,
+        _spec_value(spec, "name") or "unnamed",
+        info["device"],
+        info["fingerprint"],
     )
     return info
 
@@ -370,41 +366,17 @@ def _rpc_unload(model_id, abandon=False):
 
 
 def _rpc_load_model(spec_dict):
-    """Load a model into the ``DEFAULT_MODEL_ID`` slot (``TorchRpcInferenceProvider``).
-
-    Args:
-        spec_dict: Dictionary containing all model information including:
-            - model_class: The actual model class (serialized by torch.distributed.rpc)
-            - model_path: Path to model weights
-            - name: Model name
-            - type: Model type (e.g., 'pytorch')
-    """
+    """Load a locally allowlisted model into the provider's default slot."""
     logger.info(f"Loading model on RPC worker: {spec_dict.get('name', 'unnamed')}")
 
     try:
         state = _get_worker_state()
 
-        # Extract model information
-        model_class = spec_dict["model_class"]
-        model_path = spec_dict["model_path"]
         model_name = spec_dict.get("name", "unnamed")
-
-        # Instantiate the model
-        model = model_class()
-
-        # Load weights if path exists
-        if model_path and Path(model_path).exists():
-            import torch
-
-            state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
-            model.load_state_dict(state_dict)
-            logger.info(f"Loaded model weights from {model_path}")
-
-        # Set to evaluation mode
-        model.eval()
+        model, fingerprint = _load_model(spec_dict, state.get("device") or "cpu")
 
         # Store in the provider's slot
-        _register(DEFAULT_MODEL_ID, model, _fingerprint(model))
+        _register(DEFAULT_MODEL_ID, model, fingerprint)
         state["spec"] = spec_dict
         state["initialized"] = True
 
@@ -432,8 +404,7 @@ def _rpc_infer(model_id, tensor, device_hint="cpu"):
 
 
 def _rpc_stop(graceful=True):
-    """End the worker. ``graceful``: leave the RPC group together with the server; False:
-    leave at once, as the server does when a call is still in flight."""
+    """End the worker; ``graceful`` is retained for compatibility with local callers."""
 
     state = _get_worker_state()
     state["stop_graceful"] = bool(graceful)
@@ -460,176 +431,101 @@ def _rpc_status():
     }
 
 
-def _init_dist(rank: int, world_size: int, backend: str = "gloo"):
-    """Initialize torch.distributed process group in a forward compatible way.
+def run_ipc_worker(conn, model_classes, *, device="cpu"):
+    """Serve only our parent's inherited pipe; never open a network endpoint."""
 
-    PyTorch 2.0 deprecates directly constructing ProcessGroup objects; use init_process_group.
-    Idempotent: safe to call multiple times inside same process.
-    """
-    state = _get_worker_state()
-    if state.get("pg_initialized", False):
-        return
-    if dist.is_available() and not dist.is_initialized():
-        logger.info(
-            "Initializing process group backend=%s rank=%d world_size=%d", backend, rank, world_size
-        )
-        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
-    state["pg_initialized"] = True
+    from .worker_ipc import receive_message, send_message
 
-
-def _signal_ready(master_addr: str, ready_port: int, timeout: float) -> None:
-    """Tell the parent this process is about to rendezvous (loopback TCP, one line)."""
-
-    with socket.create_connection((master_addr, ready_port), timeout=timeout) as conn:
-        conn.sendall(f"ready {os.getpid()}\n".encode("ascii"))
-
-
-def run_worker(
-    worker_name,
-    model_spec=None,
-    rank=1,
-    world_size=2,
-    master_addr="127.0.0.1",
-    master_port=29500,
-    backend: str = "gloo",
-    *,
-    ready_port: int = 0,
-    startup_timeout_s: float = 0.0,
-    device=None,
-    watch_parent: bool = True,
-):
-    """Entry point for RPC worker process.
-
-    - Sets env vars for rendezvous
-    - Preloads ``model_spec`` into the ``DEFAULT_MODEL_ID`` slot when given
-    - With ``ready_port``, tells the parent that it is about to rendezvous
-    - Initializes torch.distributed process group (forward compatible API), bounded by
-      ``startup_timeout_s`` when given
-    - Starts RPC framework
-    - Serves ``_rpc_*`` calls until ``_rpc_stop`` or, with ``watch_parent``, until its
-      parent process is gone; ``device`` is where ``_rpc_load`` builds models
-    """
-    os.environ.setdefault("MASTER_ADDR", master_addr)
-    os.environ.setdefault("MASTER_PORT", str(master_port))
+    global _worker_model_classes
+    _worker_model_classes = model_classes
     state = _get_worker_state()
     state["device"] = device
-    parent_pid = os.getppid()
-    if model_spec is not None:
-        logger.info("Loading model for worker %s", worker_name)
-        _register(DEFAULT_MODEL_ID, *_load_model(model_spec))
-    logger.info(
-        "Ensuring process group then initializing RPC (name=%s rank=%d world_size=%d)",
-        worker_name,
-        rank,
-        world_size,
-    )
-    init_method = f"tcp://{master_addr}:{master_port}"
-    pg_kwargs = {}
-    opts = rpc.TensorPipeRpcBackendOptions(init_method=init_method)
-    if startup_timeout_s:
-        pg_kwargs["timeout"] = timedelta(seconds=float(startup_timeout_s))
-        opts.rpc_timeout = float(startup_timeout_s)
-    if ready_port:
-        _signal_ready(master_addr, int(ready_port), float(startup_timeout_s or 60.0))
-    if dist.is_available() and not dist.is_initialized():
-        logger.info("Initializing process group (worker) backend=gloo %s", init_method)
-        dist.init_process_group(
-            backend="gloo", rank=rank, world_size=world_size, init_method=init_method, **pg_kwargs
-        )
-    rpc.init_rpc(worker_name, rank=rank, world_size=world_size, rpc_backend_options=opts)
-    logger.info("RPC initialized for worker %s", worker_name)
     state["rpc_initialized"] = True
-    orphaned = False
+    state["stop_requested"] = False
+    operations = {
+        fn.__name__: fn
+        for fn in (
+            _rpc_load,
+            _rpc_load_model,
+            _rpc_infer,
+            _rpc_unload,
+            _rpc_status,
+            _rpc_ping,
+            _rpc_stop,
+        )
+    }
+    send_lock = threading.Lock()
+
+    def respond(request):
+        try:
+            operation = operations.get(request["operation"])
+            if operation is None:
+                raise ValueError("unknown worker operation")
+            reply = {"id": request["id"], "result": operation(*request["args"])}
+            with send_lock:
+                send_message(conn, reply)
+        except Exception as exc:
+            logger.exception("PyTorch worker operation failed")
+            try:
+                with send_lock:
+                    send_message(
+                        conn, {"id": request["id"], "error": f"{type(exc).__name__}: {exc}"}
+                    )
+            except (OSError, EOFError):
+                logger.debug("Parent closed the worker pipe")
+
+    send_message(conn, {"ready": os.getpid()})
     try:
-        while True:
-            if state.get("stop_requested", False):
-                logger.info("Stop requested via _rpc_stop; exiting loop")
+        while not state["stop_requested"]:
+            request = receive_message(conn)
+            if not isinstance(request, dict) or set(request) != {"id", "operation", "args"}:
+                raise ValueError("invalid worker request")
+            if type(request["id"]) is not int or not isinstance(request["operation"], str):
+                raise ValueError("invalid worker request identity")
+            if not isinstance(request["args"], (tuple, list)):
+                raise ValueError("invalid worker arguments")
+            if request["operation"] == "_rpc_stop":
+                respond(request)
                 break
-            if watch_parent and os.getppid() != parent_pid:
-                logger.warning("Parent process %d is gone; exiting", parent_pid)
-                orphaned = True
-                break
-            time.sleep(0.1)
-    except KeyboardInterrupt:
-        pass
+            # A hung model must not hold up stop, status, or abandonment. Daemon
+            # threads exit with the worker when the parent's pipe closes.
+            threading.Thread(target=respond, args=(request,), daemon=True).start()
+    except EOFError:
+        logger.info("Parent closed the worker pipe; exiting")
     finally:
-        logger.info("Shutting down RPC worker %s", worker_name)
-        try:
-            # A graceful shutdown waits for the driver's own; an orphan has no driver,
-            # and a driver that stops with a call in flight leaves at once.
-            rpc.shutdown(graceful=not orphaned and state.get("stop_graceful", True))
-        finally:
-            if dist.is_available() and dist.is_initialized():  # best-effort cleanup
-                try:
-                    dist.destroy_process_group()
-                    logger.info("Destroyed process group")
-                except Exception:
-                    logger.exception("Failed destroying process group")
+        conn.close()
+        state["rpc_initialized"] = False
 
 
-def _join_server(master_addr: str, ready_port: int, timeout: float) -> socket.socket:
-    """Report ``ready <pid>`` to a server waiting for an external worker; retry until ``ok``.
+def run_worker(*args, **kwargs):
+    """Legacy network worker entry point: fail closed instead of starting Torch RPC."""
 
-    The server listens only while a PyTorch load waits for this worker, so a worker
-    started first keeps trying, every 0.5 s. Returns the open connection: the caller
-    keeps it open, unwritten, until this process exits, and the server reads its
-    closing as this worker's exit.
-    """
+    from .managers import EXTERNAL_RPC_ERROR
 
-    while True:
-        conn = None
-        try:
-            conn = socket.create_connection((master_addr, ready_port), timeout=timeout)
-            conn.sendall(f"ready {os.getpid()}\n".encode("ascii"))
-            if conn.recv(16).split() == [b"ok"]:
-                return conn
-        except OSError:
-            pass
-        if conn is not None:
-            conn.close()
-        time.sleep(0.5)
+    raise RuntimeError(EXTERNAL_RPC_ERROR)
 
 
 def main(argv=None) -> int:
-    """``python -m nxmndr.server.rpc_worker``: the worker of a server in external mode.
+    """External Torch RPC is disabled; use nxmndr-server's gRPC API instead."""
 
-    Waits for the server at ``--master`` (its MASTER_ADDR as seen from this host) to
-    load a PyTorch model, joins its RPC group at ``--master:--port``, serves until the
-    server stops it, then exits. Model weights load from paths on this host.
-    """
+    from .managers import EXTERNAL_RPC_ERROR, RPC_EXTERNAL_DEFAULT_PORT, RPC_STARTUP_TIMEOUT_SECONDS
 
-    from .managers import RPC_EXTERNAL_DEFAULT_PORT, RPC_STARTUP_TIMEOUT_SECONDS, RPC_WORKER_NAME
-
-    parser = argparse.ArgumentParser(prog="python -m nxmndr.server.rpc_worker", description=main.__doc__)
+    parser = argparse.ArgumentParser(
+        prog="python -m nxmndr.server.rpc_worker", description=main.__doc__
+    )
     parser.add_argument("--master", required=True, help="the nxmndr server's address")
-    parser.add_argument("--port", type=int, default=RPC_EXTERNAL_DEFAULT_PORT, help="its MASTER_PORT")
+    parser.add_argument(
+        "--port", type=int, default=RPC_EXTERNAL_DEFAULT_PORT, help="its MASTER_PORT"
+    )
     parser.add_argument("--device", default="cpu", help="cpu, cuda, cuda:N or mps")
     parser.add_argument(
         "--timeout", type=float, default=RPC_STARTUP_TIMEOUT_SECONDS, help="rendezvous bound, s"
     )
-    args = parser.parse_args(argv)
-    if args.device.startswith("cuda") and not torch.cuda.is_available():
-        parser.error(f"--device {args.device}: CUDA is not available on this host")
-    if args.device == "mps" and not torch.backends.mps.is_available():
-        parser.error("--device mps: MPS is not available on this host")
-    configure_cudnn()
-    logger.info("waiting for the nxmndr server at %s:%d", args.master, args.port + 1)
-    with _join_server(args.master, args.port + 1, args.timeout):  # open until this worker exits
-        run_worker(
-            RPC_WORKER_NAME,
-            None,
-            master_addr=args.master,
-            master_port=args.port,
-            startup_timeout_s=args.timeout,
-            device=args.device,
-            watch_parent=False,
-        )
-    return 0
+    parser.parse_args(argv)
+    parser.error(EXTERNAL_RPC_ERROR)
 
 
 if __name__ == "__main__":
-    # Run the imported module, not this __main__ copy: RPC calls such as _rpc_stop
-    # resolve nxmndr.server.rpc_worker and must see the same _worker_state.
     from nxmndr.server.rpc_worker import main as _main
 
     raise SystemExit(_main())

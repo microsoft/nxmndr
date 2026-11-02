@@ -14,18 +14,15 @@ from __future__ import annotations
 import ipaddress
 import multiprocessing
 import os
-import socket
 import threading
 import time
-from datetime import timedelta
 from functools import partial
+from multiprocessing.process import BaseProcess
 from types import SimpleNamespace
 from typing import Callable, Dict, List, Optional
 
-import torch.distributed as dist
-import torch.distributed.rpc as torch_rpc
-
 from ..logging import get_logger
+from .worker_ipc import WorkerClient, receive_message
 from .model_cache import (
     SESSION_CLOSE_REASONS,
     CacheExhaustedError,
@@ -200,15 +197,10 @@ class ModelManager(ModelCache):
         )
 
 
-# The PyTorch RPC worker's names in its two-rank torch.distributed.rpc group.
+# Compatibility names for the private PyTorch worker.
 RPC_DRIVER_NAME = "driver"
 RPC_WORKER_NAME = "worker"
-# Bound on starting the PyTorch RPC worker, applied twice: to the child's readiness
-# handshake and to the torch rendezvous that follows it. It is also the RPC group's
-# default timeout, which applies to the calls that set none (unload, status); a load,
-# an inference call and the stop have their own bounds. 60 s is torch's default RPC
-# timeout (torch.distributed.rpc.constants.DEFAULT_RPC_TIMEOUT_SEC); a warm start took
-# 0.5 s on macOS arm64.
+# Bound on the spawned child's readiness and on calls without an explicit timeout.
 RPC_STARTUP_TIMEOUT_SECONDS = 60.0
 # Bound on one model load in the worker (_rpc_load). It detects a hung worker; it does
 # not bound normal load latency. The largest catalog weights file (regnet_y_128gf,
@@ -217,25 +209,18 @@ RPC_STARTUP_TIMEOUT_SECONDS = 60.0
 # and OpenSession, so a slow load that is still progressing lands in the model cache for
 # the client's next attempt instead of being abandoned.
 RPC_LOAD_TIMEOUT_SECONDS = 300.0
-# Stopping the worker: the _rpc_stop call and each join of the child get this long, and
-# so does the wait for the worker in a graceful RPC shutdown (the values the earlier
-# stop() used). A graceful shutdown also waits until no call of this process is in
-# flight, whatever its timeout (torch 2.11's TensorPipe agent): up to
-# RPC_LOAD_TIMEOUT_SECONDS for a load. So stop() leaves gracefully only when no call is
-# in flight, and otherwise at once on both ranks.
+# Bound on the stop call and each join of the child.
 RPC_STOP_TIMEOUT_SECONDS = 2.0
 # Aux resource name of a PyTorch record's model in the RPC worker.
 RPC_MODEL_RESOURCE = "pytorch_rpc_model"
-# The address the RPC group listens on (MASTER_ADDR) unless configured: loopback, so
-# only processes on this host can reach it. torch.distributed.rpc has no
-# authentication and unpickles every call, so a worker on another host needs an
-# explicit MASTER_ADDR (an address of this host that it can reach, or 0.0.0.0).
+# Legacy configuration is retained for explicit refusal of external workers.
 RPC_DEFAULT_ADDR = "127.0.0.1"
-# External worker mode (NXMNDR_RPC_EXTERNAL_WORKER=1): the server does not spawn the
-# worker; one started with ``python -m nxmndr.server.rpc_worker`` reports to
-# MASTER_PORT + 1 and joins the group at MASTER_ADDR:MASTER_PORT. Default port: 29500,
-# run_worker's and torch's usual MASTER_PORT.
 RPC_EXTERNAL_DEFAULT_PORT = 29500
+EXTERNAL_RPC_ERROR = (
+    "external PyTorch RPC workers are disabled: torch.distributed.rpc deserializes "
+    "unauthenticated Python objects. Use nxmndr-server on the worker host and "
+    "RemoteInferenceProvider over gRPC instead"
+)
 
 
 class RpcWorkerStartError(RuntimeError):
@@ -243,21 +228,11 @@ class RpcWorkerStartError(RuntimeError):
 
 
 class RpcWorkerNotJoinedError(RpcWorkerStartError):
-    """External worker mode: no worker reported within the startup timeout."""
+    """Legacy external worker configuration is not supported."""
 
 
-# torch.distributed and torch.distributed.rpc are process-global, and a process
-# cannot join a second group after its first (torch numbers its store prefixes per
-# process, so a fresh child never meets a second attempt). So one manager per
-# process may enter the torch rendezvous, once.
 _PROCESS_LOCK = threading.Lock()
-_process_owner: Optional["RpcWorkerManager"] = None
-
-
-def _free_port(addr: str) -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind((addr, 0))
-        return sock.getsockname()[1]
+_process_workers: set["RpcWorkerManager"] = set()
 
 
 def _is_loopback(addr: str) -> bool:
@@ -275,9 +250,6 @@ def _is_loopback(addr: str) -> bool:
 def _terminate(proc) -> None:
     """End a child process: wait, terminate, then kill, each bounded."""
 
-    if isinstance(proc, _ExternalWorker):
-        proc.close()  # not this server's child: drop its connection; it exits on _rpc_stop
-        return
     if proc is None or proc.pid is None:
         return  # never started
     proc.join(timeout=RPC_STOP_TIMEOUT_SECONDS)
@@ -290,99 +262,16 @@ def _terminate(proc) -> None:
 
 
 def _run_rpc_worker(
-    master_addr: str,
-    master_port: int,
-    ready_port: int,
-    startup_timeout_s: float,
+    conn,
+    model_classes,
     device: str = "cpu",
 ) -> None:
-    """Process target of the PyTorch RPC worker.
+    """Spawn target; only the trusted parent supplies classes and the private pipe."""
 
-    Module level so the ``spawn`` start method can pickle it; a nested function
-    cannot be pickled. The worker module is imported in the child only. The worker
-    starts with no model: the server loads each model by its model ID, on ``device``.
-    """
+    from .rpc_worker import configure_cudnn, run_ipc_worker
 
-    from .rpc_worker import configure_cudnn, run_worker
-
-    configure_cudnn()  # the server's cuDNN policy; a spawned child does not inherit it
-    run_worker(
-        RPC_WORKER_NAME,
-        None,
-        rank=1,
-        world_size=2,
-        master_addr=master_addr,
-        master_port=master_port,
-        ready_port=ready_port,
-        startup_timeout_s=startup_timeout_s,
-        device=device,
-    )
-
-
-class _ExternalWorker:
-    """Stands in for the child process when the worker was started by hand (external mode).
-
-    The worker keeps its handshake connection open for its whole life and never writes
-    to it after ``ready``, so the connection closing means the worker process exited.
-    A worker host that drops off the network closes nothing: RPC calls time out instead.
-    This server cannot end that process; it exits on ``_rpc_stop``.
-    """
-
-    exitcode = None
-
-    def __init__(self, pid: int, host: str, conn: socket.socket):
-        self.pid = pid
-        self.host = host
-        self._conn = conn
-        conn.setblocking(False)
-
-    def is_alive(self) -> bool:
-        try:
-            # b"": the worker closed it. Stray bytes are dropped, so a later close is seen.
-            return self._conn.recv(64) != b""
-        except BlockingIOError:
-            return True  # open, nothing to read
-        except OSError:
-            return False  # reset, or closed here
-
-    def close(self) -> None:
-        self._conn.close()
-
-
-def _await_external(addr: str, port: int, timeout: float) -> _ExternalWorker:
-    """Wait on ``addr:port + 1`` for an external worker's ``ready <pid>``; answer ``ok``.
-
-    The accepted connection stays open in the returned ``_ExternalWorker``: it tracks
-    the worker process.
-    """
-
-    try:
-        listener = socket.create_server((addr, port + 1))
-    except OSError as exc:
-        raise RpcWorkerStartError(
-            f"cannot listen for the external PyTorch RPC worker on {addr}:{port + 1}: {exc}"
-        ) from exc
-    deadline = time.monotonic() + timeout
-    with listener:
-        listener.settimeout(0.1)
-        while time.monotonic() < deadline:
-            try:
-                conn, peer = listener.accept()
-            except socket.timeout:
-                continue
-            conn.settimeout(max(0.1, deadline - time.monotonic()))
-            try:
-                line = conn.recv(64).decode("ascii", "replace").split()
-                if len(line) == 2 and line[0] == "ready" and line[1].isdigit():
-                    conn.sendall(b"ok\n")
-                    return _ExternalWorker(int(line[1]), peer[0], conn)
-            except OSError:
-                pass
-            conn.close()
-    raise RpcWorkerNotJoinedError(
-        f"no external PyTorch RPC worker joined at {addr}:{port} within {timeout:g} s; start "
-        f"one with: python -m nxmndr.server.rpc_worker --master <this host's address> --port {port}"
-    )
+    configure_cudnn()
+    run_ipc_worker(conn, model_classes, device=device)
 
 
 class _RpcModelHandle:
@@ -406,30 +295,10 @@ class _RpcModelHandle:
 
 
 class RpcWorkerManager:
-    """The PyTorch RPC worker of one server: start, per-model load/infer/unload, stop.
+    """Local PyTorch worker, reached only through an inherited, data-only pipe.
 
-    Start order: the child process starts first and reports over a loopback socket
-    that it is about to rendezvous; only then does this process join the two-rank
-    group as the driver, so both ranks are present. Each phase is bounded by
-    ``startup_timeout_s``. A child that exits or never reports fails the load with
-    ``RpcWorkerStartError`` and is terminated; a later load tries again. A failure
-    inside the torch rendezvous also terminates the child, but torch cannot rejoin a
-    group in this process, so later loads fail until the server restarts; so does a
-    worker that exits after it started.
-
-    External mode (``external_worker``, or ``NXMNDR_RPC_EXTERNAL_WORKER=1``): no child
-    is spawned; the first phase waits for a worker started elsewhere to report to
-    ``MASTER_PORT + 1`` (``_await_external``). A wait that times out raises
-    ``RpcWorkerNotJoinedError`` and a later load waits again. The worker keeps that
-    report connection open, so its closing tells this server that the worker exited.
-
-    The spawned worker builds every model on ``device``. An external worker uses its
-    own ``--device``: the server's devices describe the server's host, not the worker's.
-
-    ``stop`` (from ``stop_server``) ends the worker for good: torch keeps per-process
-    RPC state that a second group cannot reuse, so no later manager in this process
-    can start one, and it is refused with that reason. It does not wait for a call in
-    flight (a load still building, an inference call): that call fails.
+    Register custom classes before the first load: the class allowlist is supplied
+    at spawn, never imported from a worker message. External Torch RPC is refused.
     """
 
     # The child's process target; tests replace it with a module-level function.
@@ -446,18 +315,18 @@ class RpcWorkerManager:
     ):
         self._lock = threading.Lock()
         self._calls_lock = threading.Lock()
-        self._calls = 0  # rpc_sync calls in flight (_call); stop reads it
-        self._proc = None
-        self._state = "idle"  # idle -> running -> stopped; "broken" after a failed rendezvous
-        self._error = ""
+        self._calls = 0
+        self._client: Optional[WorkerClient] = None
+        self._model_classes: Dict[str, type] = {}
+        self._proc: Optional[BaseProcess] = None
+        self._state = "idle"
         if external_worker is None:
             flag = os.environ.get("NXMNDR_RPC_EXTERNAL_WORKER", "").strip().lower()
             external_worker = flag not in {"", "0", "false", "no", "off"}
         self._external = bool(external_worker)
-        # An empty MASTER_ADDR would bind every interface: it means the default.
+        # Retained only for the existing external-mode upload refusal, not for binding.
         self._addr = (master_addr or os.environ.get("MASTER_ADDR", "")).strip() or RPC_DEFAULT_ADDR
         self._port = int(master_port or os.environ.get("MASTER_PORT", "0") or 0)
-        self._store = None  # the rendezvous TCPStore server, bound to self._addr
         self.startup_timeout_s = float(startup_timeout_s)
         self.device = str(device or "cpu")
 
@@ -470,151 +339,78 @@ class RpcWorkerManager:
     # ---- start ------------------------------------------------------------
 
     def ensure_started(self) -> None:
-        """Start the worker and join its RPC group once; raise ``RpcWorkerStartError``."""
+        """Start the private worker once; raise ``RpcWorkerStartError`` on failure."""
 
         with self._lock:
             if self._state == "running":
                 proc = self._proc
                 if proc is not None and proc.is_alive():
                     return
-                if isinstance(proc, _ExternalWorker):
-                    gone = (
-                        f"the external PyTorch RPC worker (pid {proc.pid} on {proc.host}) "
-                        "disconnected"
-                    )
-                else:
-                    gone = (
-                        "the PyTorch RPC worker exited (exit code "
-                        f"{getattr(proc, 'exitcode', None)})"
-                    )
                 raise RpcWorkerStartError(
-                    f"{gone}; torch cannot rejoin an RPC group in this process, so restart "
-                    "the server to use PyTorch models"
+                    f"the PyTorch RPC worker exited (exit code {getattr(proc, 'exitcode', None)}); "
+                    "restart the server to use PyTorch models"
                 )
             if self._state == "stopped":
                 raise RpcWorkerStartError(
                     "the PyTorch RPC worker was stopped; restart the server to use PyTorch models"
                 )
-            if self._state == "broken":
-                raise RpcWorkerStartError(
-                    f"the PyTorch RPC group of this server failed to start ({self._error}); "
-                    "restart the server to use PyTorch models"
-                )
             self._start_locked()
 
     def _start_locked(self) -> None:
-        global _process_owner
+        from ..models import get_registry
+
+        if self._external:
+            raise RpcWorkerNotJoinedError(EXTERNAL_RPC_ERROR)
+        self._model_classes.update(get_registry().list_model_classes())
+        ctx = multiprocessing.get_context("spawn")
+        parent, child = ctx.Pipe()
+        proc = ctx.Process(
+            target=type(self).worker_target,
+            args=(child, self._model_classes, self.device),
+            daemon=True,
+            name="nxmndr-pytorch-worker",
+        )
+        try:
+            proc.start()
+            child.close()
+            self._await_ready(proc, parent, self.startup_timeout_s)
+            self._client = WorkerClient(parent)
+        except BaseException:
+            parent.close()
+            _terminate(proc)
+            raise
+        finally:
+            child.close()
+        self._proc = proc
+        self._state = "running"
         with _PROCESS_LOCK:
-            if _process_owner is not None and _process_owner is not self:
-                if _process_owner._state in ("stopped", "broken"):
-                    raise RpcWorkerStartError(
-                        "this process already ran its PyTorch RPC group; "
-                        "torch.distributed.rpc keeps per-process state that a second group "
-                        "cannot reuse, so generic PyTorch models need a server in a new process"
-                    )
-                raise RpcWorkerStartError(
-                    "another server in this process already runs the PyTorch RPC worker; "
-                    "torch allows one RPC group per process"
-                )
-            if dist.is_initialized() or torch_rpc._is_current_rpc_agent_set():  # type: ignore[attr-defined]
-                raise RpcWorkerStartError(
-                    "this process already belongs to a torch.distributed group; the PyTorch "
-                    "RPC worker needs a process of its own"
-                )
-            timeout = self.startup_timeout_s
-            addr = self._addr
-            if self._external:
-                port = self._port or RPC_EXTERNAL_DEFAULT_PORT
-                proc = _await_external(addr, port, timeout)
-            else:
-                port = self._port or _free_port(addr)
-                listener = socket.create_server((addr, 0))
-                listener.settimeout(0.1)
-                # spawn: the child must not inherit this process's gRPC and torch threads.
-                proc = multiprocessing.get_context("spawn").Process(
-                    target=type(self).worker_target,
-                    args=(addr, port, listener.getsockname()[1], timeout, self.device),
-                    daemon=True,
-                    name="nxmndr-pytorch-rpc-worker",
-                )
-                try:
-                    proc.start()
-                    self._await_ready(proc, listener, timeout)
-                except BaseException:
-                    _terminate(proc)
-                    raise
-                finally:
-                    listener.close()
-            _process_owner = self  # from here on this process has used its one attempt
-            init_method = f"tcp://{addr}:{port}"
-            try:
-                # torch's TCPStore server listens on every interface whatever init_method
-                # names; bind the rendezvous port on addr here and hand the socket to a
-                # multi-tenant TCPStore, which init_process_group and init_rpc then reuse.
-                listen_fd = socket.create_server((addr, port)).detach()
-                self._store = dist.TCPStore(
-                    addr,
-                    port,
-                    2,
-                    True,
-                    timedelta(seconds=timeout),
-                    wait_for_workers=False,
-                    multi_tenant=True,
-                    master_listen_fd=listen_fd,
-                )
-                dist.init_process_group(
-                    backend="gloo",
-                    rank=0,
-                    world_size=2,
-                    init_method=init_method,
-                    timeout=timedelta(seconds=timeout),
-                )
-                opts = torch_rpc.TensorPipeRpcBackendOptions(
-                    init_method=init_method, rpc_timeout=timeout
-                )
-                torch_rpc.init_rpc(RPC_DRIVER_NAME, rank=0, world_size=2, rpc_backend_options=opts)
-            except BaseException as exc:
-                self._state = "broken"
-                self._error = f"{type(exc).__name__}: {exc}"
-                _terminate(proc)
-                self._leave_group(graceful=False)
-                self._store = None
-                raise RpcWorkerStartError(
-                    f"the PyTorch RPC worker did not complete the rendezvous at {init_method} "
-                    f"within {timeout:g} s: {self._error}"
-                ) from exc
-            self._proc = proc
-            self._state = "running"
-        logger.info("PyTorch RPC worker pid=%s joined the RPC group at %s", proc.pid, init_method)
+            _process_workers.add(self)
+        logger.info("PyTorch worker pid=%s ready on private IPC", proc.pid)
 
     @staticmethod
-    def _await_ready(proc, listener, timeout: float) -> None:
-        """Wait for the child's ``ready <pid>`` line; fail fast if it exits."""
+    def _await_ready(proc, conn, timeout: float) -> None:
+        """Only the spawned child holds the other end of this anonymous pipe."""
 
         deadline = time.monotonic() + timeout
         while True:
-            # Checked on every pass, so a stray local connection cannot extend the wait.
             if not proc.is_alive():
                 raise RpcWorkerStartError(
-                    f"the PyTorch RPC worker exited with code {proc.exitcode} before it "
-                    "was ready to join its RPC group"
+                    f"the PyTorch RPC worker exited with code {proc.exitcode} before it was ready"
                 )
             if time.monotonic() >= deadline:
                 raise RpcWorkerStartError(
-                    f"the PyTorch RPC worker was not ready to join its RPC group within "
-                    f"{timeout:g} s"
+                    f"the PyTorch RPC worker was not ready within {timeout:g} s"
                 )
-            try:
-                conn, _ = listener.accept()
-            except socket.timeout:
-                continue
-            with conn:
-                conn.settimeout(max(0.1, deadline - time.monotonic()))
+            if conn.poll(min(0.1, max(0, deadline - time.monotonic()))):
                 try:
-                    line = conn.recv(64).decode("ascii", "replace").split()
-                except OSError:
-                    line = []
-            if line == ["ready", str(proc.pid)]:
+                    ready = receive_message(conn)
+                except EOFError as exc:
+                    proc.join(timeout=RPC_STOP_TIMEOUT_SECONDS)
+                    raise RpcWorkerStartError(
+                        f"the PyTorch RPC worker exited with code {proc.exitcode} before it was ready"
+                    ) from exc
+                if ready != {"ready": proc.pid}:
+                    raise RpcWorkerStartError("invalid PyTorch worker readiness message")
                 return
 
     # ---- models -------------------------------------------------------------
@@ -646,13 +442,27 @@ class RpcWorkerManager:
             payload["catalog_args"] = dict(getattr(model_spec, "catalog_args", None) or {})
         elif not callable(model_class):
             raise ValueError(catalog.unknown_class_message(model_class))
+        else:
+            class_name = f"{model_class.__module__}.{model_class.__qualname__}"
+            with self._lock:
+                if self._state == "idle":
+                    self._model_classes[class_name] = model_class
+                elif self._model_classes.get(class_name) is not model_class:
+                    class_name = next(
+                        (name for name, cls in self._model_classes.items() if cls is model_class),
+                        "",
+                    )
+                    if not class_name:
+                        raise ValueError("register custom model classes before the worker starts")
+            payload["model_class"] = class_name
+        payload["model_path"] = str(payload["model_path"])
         self.ensure_started()
         from .rpc_worker import _rpc_load
 
         try:
             info = self._call(_rpc_load, (model_id, payload), timeout=RPC_LOAD_TIMEOUT_SECONDS)
         except Exception:
-            # torch does not cancel a call that timed out: the build may still finish in
+            # A timeout does not cancel the build: it may still finish in
             # the worker. Have the worker drop model_id, now or when its build ends; a
             # retry gets a new model ID, so nothing else names it.
             self.unload(model_id, abandon=True)
@@ -692,7 +502,9 @@ class RpcWorkerManager:
         try:
             return bool(self._call(_rpc_unload, args))
         except Exception:
-            logger.warning("freeing model %s in the PyTorch RPC worker failed", model_id, exc_info=True)
+            logger.warning(
+                "freeing model %s in the PyTorch RPC worker failed", model_id, exc_info=True
+            )
             return False
 
     def status(self) -> Dict[str, object]:
@@ -703,35 +515,23 @@ class RpcWorkerManager:
         return self._call(_rpc_status, ())
 
     def _call(self, func, args, **kwargs):
-        """``rpc_sync`` of the worker function ``func``, counted while it runs (``stop``).
+        """Call an allowlisted worker operation over the private pipe.
 
         ``RpcWorkerStartError`` if the worker is not running; ``kwargs``: ``timeout``.
         """
 
         with self._calls_lock:
-            if not self.is_alive():
+            client = self._client
+            if not self.is_alive() or client is None:
                 raise RpcWorkerStartError("the PyTorch RPC worker is not running")
             self._calls += 1
         try:
-            return torch_rpc.rpc_sync(RPC_WORKER_NAME, func, args=args, **kwargs)
+            return client.call(func.__name__, args, **kwargs)
         finally:
             with self._calls_lock:
                 self._calls -= 1
 
     # ---- stop ---------------------------------------------------------------
-
-    @staticmethod
-    def _leave_group(*, graceful: bool) -> None:
-        try:
-            if torch_rpc._is_current_rpc_agent_set():  # type: ignore[attr-defined]
-                torch_rpc.shutdown(graceful=graceful, timeout=RPC_STOP_TIMEOUT_SECONDS)
-        except Exception:
-            logger.warning("PyTorch RPC shutdown failed", exc_info=True)
-        try:
-            if dist.is_available() and dist.is_initialized():
-                dist.destroy_process_group()
-        except Exception:
-            logger.warning("destroying the torch.distributed process group failed", exc_info=True)
 
     def stop(self):
         with self._lock:
@@ -741,28 +541,26 @@ class RpcWorkerManager:
                 alive = proc is not None and proc.is_alive()
                 with self._calls_lock:  # no _call starts from here on: the state is stopped
                     in_flight = self._calls
-                # A graceful shutdown would wait for the calls in flight (see
-                # RPC_STOP_TIMEOUT_SECONDS). The worker ends either way, so with a call in
-                # flight both ranks leave at once and that call fails.
                 graceful = alive and in_flight == 0
-                if alive:
+                if alive and self._client is not None:
                     from .rpc_worker import _rpc_stop
 
                     try:
-                        torch_rpc.rpc_sync(
-                            RPC_WORKER_NAME,
-                            _rpc_stop,
-                            args=(graceful,),
+                        self._client.call(
+                            _rpc_stop.__name__,
+                            (graceful,),
                             timeout=RPC_STOP_TIMEOUT_SECONDS,
                         )
                     except Exception:
-                        graceful = False
                         logger.warning(
                             "_rpc_stop failed; terminating the PyTorch RPC worker", exc_info=True
                         )
-                self._leave_group(graceful=graceful)
-            self._store = None
+            if self._client is not None:
+                self._client.close()
+            self._state = "stopped"
         _terminate(proc)
+        with _PROCESS_LOCK:
+            _process_workers.discard(self)
 
     def shutdown(self):
         """Stop the worker (``InferenceService.shutdown`` and the server's atexit hook).
@@ -780,8 +578,9 @@ class RpcWorkerManager:
 def shutdown_process_rpc_worker() -> None:
     """Stop the PyTorch RPC worker this process started, if any (the server's atexit hook)."""
 
-    owner = _process_owner
-    if owner is not None:
+    with _PROCESS_LOCK:
+        owners = list(_process_workers)
+    for owner in owners:
         owner.shutdown()
 
 
